@@ -77,11 +77,34 @@ impl Symbol {
             .filter_map(|n| Property::from_sexp(n))
             .collect();
 
-        const PRESERVE: &[&str] = &["pin", "instances"];
+        // Preserve every sub-node this struct does not model explicitly.
+        //
+        // This used to be an allowlist of ["pin", "instances"], which silently
+        // dropped everything else on a load/save round-trip. `lib_name` was the
+        // damaging case: eeschema writes it ahead of `lib_id` when a placed
+        // symbol has diverged from its library (a rescue), and it is the only
+        // link from the instance to the embedded `lib_symbols` definition.
+        // Losing it makes the symbol's pins invisible to the netlister — the
+        // part disappears from every net it was on, with no error anywhere.
+        //
+        // A denylist of modelled tags keeps that class of bug from recurring as
+        // KiCAD adds fields: anything unrecognised now survives verbatim.
+        const MODELLED: &[&str] = &[
+            "lib_id",
+            "at",
+            "mirror",
+            "unit",
+            "in_bom",
+            "on_board",
+            "dnp",
+            "fields_autoplaced",
+            "uuid",
+            "property",
+        ];
         let raw_sub_nodes = node
             .args()
             .iter()
-            .filter(|n| n.tag().map(|t| PRESERVE.contains(&t)).unwrap_or(false))
+            .filter(|n| n.tag().map(|t| !MODELLED.contains(&t)).unwrap_or(false))
             .cloned()
             .collect();
 
@@ -102,6 +125,16 @@ impl Symbol {
 
     pub fn to_sexp(&self) -> SexpNode {
         let mut c = vec![atom("symbol")];
+        // eeschema emits `lib_name` immediately before `lib_id`. Keep that
+        // order rather than letting it fall in with the trailing sub-nodes —
+        // the pair is how a rescued symbol finds its embedded definition.
+        for n in self
+            .raw_sub_nodes
+            .iter()
+            .filter(|n| n.tag() == Some("lib_name"))
+        {
+            c.push(n.clone());
+        }
         c.push(tagged("lib_id", vec![qstr(self.lib_id.clone())]));
         c.push(self.at.to_sexp());
         if let Some(m) = &self.mirror {
@@ -118,7 +151,12 @@ impl Symbol {
         for p in &self.properties {
             c.push(p.to_sexp());
         }
-        c.extend(self.raw_sub_nodes.iter().cloned());
+        c.extend(
+            self.raw_sub_nodes
+                .iter()
+                .filter(|n| n.tag() != Some("lib_name"))
+                .cloned(),
+        );
         SexpNode::List(c)
     }
 
@@ -482,5 +520,63 @@ mod tests {
             "property must keep its offset"
         );
         assert_eq!((sym.at.x, sym.at.y), (110.0, 60.0));
+    }
+
+    /// A rescued symbol carries `(lib_name ...)` linking the instance to its
+    /// embedded `lib_symbols` definition. Dropping it on round-trip makes the
+    /// symbol's pins vanish from the netlist with no error reported anywhere.
+    #[test]
+    fn round_trip_preserves_lib_name() {
+        let src = r#"(symbol
+            (lib_name "MOSFET_N_2N7002_SOT23_60V_1")
+            (lib_id "granny:MOSFET_N_2N7002_SOT23_60V")
+            (at 124.46 73.66 90)
+            (unit 1)
+            (in_bom yes)
+            (on_board yes)
+            (dnp no)
+            (uuid "4944271b-1269-412a-b667-f19e0cdd4d87")
+            (property "Reference" "Q2")
+            (pin "1" (uuid "aaaaaaaa-0000-0000-0000-000000000001"))
+            (instances (project "GPS" (path "/x" (reference "Q2") (unit 1))))
+        )"#;
+        let node = crate::sexp::parser::parse(src).expect("parses");
+        let sym = Symbol::from_sexp(&node).expect("symbol parses");
+
+        let out = crate::sexp::writer::write(&sym.to_sexp());
+        assert!(
+            out.contains(r#"(lib_name "MOSFET_N_2N7002_SOT23_60V_1")"#),
+            "lib_name must survive the round-trip, got:\n{out}"
+        );
+        // eeschema writes lib_name ahead of lib_id; keep that order.
+        assert!(
+            out.find("lib_name").unwrap() < out.find("lib_id").unwrap(),
+            "lib_name must precede lib_id, got:\n{out}"
+        );
+        // The previously-preserved sub-nodes must still be there.
+        assert!(out.contains("(instances"), "instances lost:\n{out}");
+        assert!(out.contains(r#"(pin "1""#), "pin lost:\n{out}");
+    }
+
+    /// The preserve rule is a denylist of modelled tags, so sub-nodes KiCAD
+    /// adds in future survive instead of being silently discarded.
+    #[test]
+    fn round_trip_preserves_unmodelled_sub_nodes() {
+        let src = r#"(symbol
+            (lib_id "Device:R")
+            (at 10 10 0)
+            (unit 1)
+            (uuid "bbbbbbbb-0000-0000-0000-000000000002")
+            (exclude_from_sim no)
+            (duplicate_pin_numbers_are_jumpers no)
+        )"#;
+        let node = crate::sexp::parser::parse(src).expect("parses");
+        let sym = Symbol::from_sexp(&node).expect("symbol parses");
+        let out = crate::sexp::writer::write(&sym.to_sexp());
+        assert!(out.contains("exclude_from_sim"), "dropped:\n{out}");
+        assert!(
+            out.contains("duplicate_pin_numbers_are_jumpers"),
+            "dropped:\n{out}"
+        );
     }
 }
