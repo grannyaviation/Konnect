@@ -11,18 +11,200 @@
 
 use crate::sexp::{parser, SexpNode};
 use crate::Schematic;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Expand the `${VAR}` substitutions KiCAD uses inside a library-table URI.
+///
+/// `${KIPRJMOD}` resolves to the project directory (the folder holding the
+/// schematic); everything else comes from the environment, which is where
+/// `KICAD10_SYMBOL_DIR` and friends live.
+fn expand_uri(uri: &str, project_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut out = String::with_capacity(uri.len());
+    let mut rest = uri;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}')?;
+        let var = &after[..end];
+        let value = if var == "KIPRJMOD" {
+            project_dir?.to_string_lossy().into_owned()
+        } else {
+            std::env::var(var).ok()?
+        };
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(PathBuf::from(out))
+}
+
+fn between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = haystack.find(open)? + open.len();
+    let end = haystack[start..].find(close)? + start;
+    Some(&haystack[start..end])
+}
+
+/// Parse one `sym-lib-table` into `nickname -> library file` entries.
+fn parse_lib_table(path: &Path, project_dir: Option<&Path>) -> HashMap<String, PathBuf> {
+    let mut out = HashMap::new();
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    // Entries are one per line: (lib (name "X") (type "KiCad") (uri "Y") ...)
+    for line in content.lines() {
+        let (Some(name), Some(uri)) = (
+            between(line, "(name \"", "\")"),
+            between(line, "(uri \"", "\")"),
+        ) else {
+            continue;
+        };
+        if let Some(p) = expand_uri(uri, project_dir) {
+            out.insert(name.to_string(), p);
+        }
+    }
+    out
+}
+
+/// KiCAD's per-user config directories, newest version first.
+fn kicad_config_dirs() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+        roots.push(PathBuf::from(x).join("kicad"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(PathBuf::from(&home).join(".config/kicad"));
+        roots.push(PathBuf::from(&home).join("Library/Preferences/kicad"));
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(appdata).join("kicad"));
+    }
+
+    let mut versioned = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                versioned.push(e.path());
+            }
+        }
+    }
+    // "10.0" must beat "9.0"; plain lexicographic sorting inverts that.
+    versioned.sort_by(|a, b| {
+        let key = |p: &PathBuf| -> (u32, u32) {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let mut it = name.split('.');
+            (
+                it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            )
+        };
+        key(b).cmp(&key(a))
+    });
+    versioned
+}
+
+/// Nickname -> library file, from KiCAD's project and global symbol tables.
+///
+/// Konnect previously ignored `sym-lib-table` entirely and resolved a lib_id
+/// purely by scanning `find_symbol_dirs()` for `<Nickname>.kicad_sym`. That
+/// makes every project-scoped library invisible to `add_schematic_component`
+/// and `replace_component` — the common case for custom parts — and it breaks
+/// any library whose nickname differs from its filename. Project entries win
+/// over global ones, matching KiCAD's own precedence.
+pub fn library_table_entries(project_dir: Option<&Path>) -> HashMap<String, PathBuf> {
+    let mut out = HashMap::new();
+    for dir in kicad_config_dirs() {
+        let table = dir.join("sym-lib-table");
+        if table.is_file() {
+            for (k, v) in parse_lib_table(&table, project_dir) {
+                out.entry(k).or_insert(v);
+            }
+        }
+    }
+    if let Some(pd) = project_dir {
+        for (k, v) in parse_lib_table(&pd.join("sym-lib-table"), project_dir) {
+            out.insert(k, v);
+        }
+    }
+    out
+}
+
+/// Project directory for callers that have no schematic path in hand.
+fn env_project_dir() -> Option<PathBuf> {
+    std::env::var("KONNECT_PROJECT_DIR").ok().map(PathBuf::from)
+}
+
+/// Read one symbol out of a `.kicad_sym` file, prefixing its name with the
+/// library nickname the way an embedded `lib_symbols` entry expects.
+///
+/// Unit sub-symbols ("Name_0_1", "Name_1_1") must stay UNPREFIXED: eeschema
+/// names only the outer symbol with the library prefix and refuses to load a
+/// schematic whose units carry it ("Failed to load schematic" — verified
+/// against kicad-cli 10.0 and the KiCAD demo corpus).
+fn read_symbol_from(file: &Path, library_name: &str, symbol_name: &str) -> Option<String> {
+    let content = std::fs::read_to_string(file).ok()?;
+    let block = extract_symbol_block(&content, symbol_name)?;
+    let mut renamed = block.replacen(
+        &format!("(symbol \"{}\"", symbol_name),
+        &format!("(symbol \"{}:{}\"", library_name, symbol_name),
+        1,
+    );
+    // Also fix (extends "ParentName") to use the prefixed name.
+    if let Some(ext_pos) = renamed.find("(extends \"") {
+        let after = &renamed[ext_pos + 10..];
+        if let Some(end) = after.find('"') {
+            let parent = after[..end].to_string();
+            renamed = renamed.replace(
+                &format!("(extends \"{}\")", parent),
+                &format!("(extends \"{}:{}\")", library_name, parent),
+            );
+        }
+    }
+    Some(renamed)
+}
 
 /// Resolve a lib_id (e.g. "Device:R") to the full symbol S-expression string.
 /// The returned string is the raw content of the `(symbol "R" ...)` block,
 /// with the name prefixed as `"Device:R"`.
+///
+/// Uses `KONNECT_PROJECT_DIR` to locate a project `sym-lib-table`. Prefer
+/// [`resolve_lib_symbol_in`] when the schematic path is known — it needs no
+/// environment variable.
 pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
+    resolve_lib_symbol_in(env_project_dir().as_deref(), lib_id)
+}
+
+/// Resolve a lib_id, consulting the project's `sym-lib-table` first.
+pub fn resolve_lib_symbol_in(project_dir: Option<&Path>, lib_id: &str) -> Option<String> {
     let parts: Vec<&str> = lib_id.splitn(2, ':').collect();
     if parts.len() != 2 {
         return None;
     }
     let (library_name, symbol_name) = (parts[0], parts[1]);
 
+    // 1. Library tables map a nickname to an explicit path. This is the only
+    //    branch that can find a project-scoped library, or one whose nickname
+    //    differs from its filename.
+    if let Some(file) = library_table_entries(project_dir).get(library_name) {
+        if file.is_dir() {
+            // KiCAD 10 .kicad_symdir referenced directly by the table.
+            let sym_file = file.join(format!("{}.kicad_sym", symbol_name));
+            if let Some(s) = read_symbol_from(&sym_file, library_name, symbol_name) {
+                return Some(s);
+            }
+        } else if let Some(s) = read_symbol_from(file, library_name, symbol_name) {
+            return Some(s);
+        }
+    }
+
+    // 2. Fall back to scanning the known symbol directories by filename.
     for base_dir in find_symbol_dirs() {
         // KiCAD 10: Library.kicad_symdir/SymbolName.kicad_sym
         let symdir = base_dir.join(format!("{}.kicad_symdir", library_name));
@@ -93,7 +275,12 @@ pub fn resolve_lib_symbol(lib_id: &str) -> Option<String> {
 
 /// Resolve a lib_id to a parsed SexpNode tree.
 pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
-    let raw = resolve_lib_symbol(lib_id)?;
+    resolve_lib_symbol_node_in(env_project_dir().as_deref(), lib_id)
+}
+
+/// [`resolve_lib_symbol_node`], scoped to a project directory.
+pub fn resolve_lib_symbol_node_in(project_dir: Option<&Path>, lib_id: &str) -> Option<SexpNode> {
+    let raw = resolve_lib_symbol_in(project_dir, lib_id)?;
     parser::parse(&raw).ok()
 }
 
@@ -111,7 +298,15 @@ pub fn resolve_lib_symbol_node(lib_id: &str) -> Option<SexpNode> {
 /// eeschema never writes. A missing/broken parent stops the walk gracefully,
 /// returning the partially flattened child.
 pub fn resolve_lib_symbol_flattened_node(lib_id: &str) -> Option<SexpNode> {
-    let mut node = resolve_lib_symbol_node(lib_id)?;
+    resolve_lib_symbol_flattened_node_in(env_project_dir().as_deref(), lib_id)
+}
+
+/// [`resolve_lib_symbol_flattened_node`], scoped to a project directory.
+pub fn resolve_lib_symbol_flattened_node_in(
+    project_dir: Option<&Path>,
+    lib_id: &str,
+) -> Option<SexpNode> {
+    let mut node = resolve_lib_symbol_node_in(project_dir, lib_id)?;
     let child_base = lib_id.split_once(':')?.1.to_string();
 
     let mut parent_id = node.get_value("extends").map(str::to_string);
@@ -128,7 +323,7 @@ pub fn resolve_lib_symbol_flattened_node(lib_id: &str) -> Option<SexpNode> {
         if !visited.insert(pid.clone()) {
             break; // cyclic extends: stop, keep what we have
         }
-        let Some(parent) = resolve_lib_symbol_node(&pid) else {
+        let Some(parent) = resolve_lib_symbol_node_in(project_dir, &pid) else {
             break; // broken library (dangling parent): keep what we have
         };
         let parent_base = pid
@@ -259,7 +454,12 @@ pub fn ensure_lib_symbol(schematic: &mut Schematic, lib_id: &str) -> bool {
     }
 
     // Resolve and embed the symbol, flattening any extends chain.
-    let sym_node = match resolve_lib_symbol_flattened_node(lib_id) {
+    //
+    // The schematic's own directory is the project directory, so a
+    // project-scoped `sym-lib-table` resolves without the caller having to
+    // set anything — previously these lib_ids simply could not be found.
+    let project_dir = schematic.filepath().parent().map(|p| p.to_path_buf());
+    let sym_node = match resolve_lib_symbol_flattened_node_in(project_dir.as_deref(), lib_id) {
         Some(n) => n,
         None => return false,
     };
@@ -533,6 +733,81 @@ pub fn find_symbol_dirs() -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+#[cfg(test)]
+mod library_table_tests {
+    use super::*;
+
+    const SYM: &str = r#"(kicad_symbol_lib
+  (symbol "MOSFET_N_2N7002"
+    (property "Reference" "Q")
+    (symbol "MOSFET_N_2N7002_0_1")
+  )
+)
+"#;
+
+    /// A project-scoped library referenced through `sym-lib-table` with
+    /// `${KIPRJMOD}` must resolve. Konnect used to ignore the table entirely
+    /// and scan only KICAD10_SYMBOL_DIR, so custom project libraries were
+    /// invisible to add_schematic_component / replace_component.
+    #[test]
+    fn resolves_project_library_via_sym_lib_table() {
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("granny.kicad_sym"), SYM).unwrap();
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (lib (name \"granny\") (type \"KiCad\") \
+             (uri \"${KIPRJMOD}/granny.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        let got = resolve_lib_symbol_in(Some(proj.path()), "granny:MOSFET_N_2N7002")
+            .expect("project library must resolve through sym-lib-table");
+        assert!(
+            got.contains(r#"(symbol "granny:MOSFET_N_2N7002""#),
+            "outer symbol must carry the library prefix, got:\n{got}"
+        );
+        assert!(
+            got.contains(r#"(symbol "MOSFET_N_2N7002_0_1""#),
+            "unit sub-symbols must stay unprefixed, got:\n{got}"
+        );
+    }
+
+    /// The nickname need not match the filename — that mapping only exists in
+    /// the table, which is precisely what directory scanning cannot see.
+    #[test]
+    fn resolves_when_nickname_differs_from_filename() {
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("parts-v2.kicad_sym"), SYM).unwrap();
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (lib (name \"house\") (type \"KiCad\") \
+             (uri \"${KIPRJMOD}/parts-v2.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        assert!(
+            resolve_lib_symbol_in(Some(proj.path()), "house:MOSFET_N_2N7002").is_some(),
+            "nickname->file mapping from the table must be honoured"
+        );
+    }
+
+    #[test]
+    fn expand_uri_handles_kiprjmod_and_env() {
+        let proj = PathBuf::from("/tmp/proj");
+        assert_eq!(
+            expand_uri("${KIPRJMOD}/x.kicad_sym", Some(&proj)),
+            Some(PathBuf::from("/tmp/proj/x.kicad_sym"))
+        );
+        // Unknown variable: no guessing, no partial path.
+        assert_eq!(expand_uri("${NOPE_XYZZY}/x", Some(&proj)), None);
+        // Plain path passes through untouched.
+        assert_eq!(
+            expand_uri("/abs/x.kicad_sym", None),
+            Some(PathBuf::from("/abs/x.kicad_sym"))
+        );
+    }
 }
 
 #[cfg(test)]
