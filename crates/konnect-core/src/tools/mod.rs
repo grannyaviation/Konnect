@@ -749,18 +749,40 @@ pub fn lib_symbol_not_found_error(lib_id: &str) -> CallToolResult {
 /// that as an error rather than writing a definition-less instance (#34).
 #[must_use]
 pub fn ensure_lib_symbol_in_schematic(content: &mut String, lib_id: &str) -> bool {
+    ensure_lib_symbol_in_schematic_at(content, lib_id, None)
+}
+
+/// [`ensure_lib_symbol_in_schematic`], told where the schematic lives so a
+/// project-scoped `sym-lib-table` (`${KIPRJMOD}/…`) resolves.
+///
+/// Without the path this falls back to `KONNECT_PROJECT_DIR`, which means
+/// project libraries only resolve when the server was launched with that set —
+/// the exact gap that makes `replace_component` reject a lib_id that
+/// `add_schematic_component` accepts.
+#[must_use]
+pub fn ensure_lib_symbol_in_schematic_at(
+    content: &mut String,
+    lib_id: &str,
+    schematic_path: Option<&std::path::Path>,
+) -> bool {
     // Check if already present
     let lib_id_check = format!("(symbol \"{}\"", lib_id);
     if content.contains(&lib_id_check) {
         return true;
     }
 
+    let project_dir = schematic_path.and_then(|p| p.parent());
+
     // Resolve the symbol from KiCAD libraries. Prefer the flattened resolver:
     // derived symbols ((extends "Parent")) must be embedded with the parent's
     // units copied in, not as a stub kicad-cli can't netlist (#35). Fall back
     // to the local raw resolver for parity with the pre-flattening behavior.
-    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened(lib_id)
-        .or_else(|| resolve_lib_symbol(lib_id))
+    let sym_def = match konnect_schematic_editor::library::resolve_lib_symbol_flattened_node_in(
+        project_dir,
+        lib_id,
+    )
+    .map(|n| konnect_schematic_editor::sexp::writer::write(&n))
+    .or_else(|| resolve_lib_symbol(lib_id))
     {
         Some(s) => s,
         None => return false,

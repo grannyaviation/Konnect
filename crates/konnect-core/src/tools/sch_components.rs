@@ -1287,7 +1287,7 @@ async fn handle_replace_component(
     // Ensure the new library symbol definition is present. Bail BEFORE writing:
     // a replace that can't embed its definition would leave the component
     // netlist-invisible (#34).
-    if !super::ensure_lib_symbol_in_schematic(&mut content, &new_lib_id) {
+    if !super::ensure_lib_symbol_in_schematic_at(&mut content, &new_lib_id, Some(&sch_path)) {
         return Ok(crate::tools::lib_symbol_not_found_error(&new_lib_id));
     }
     write_atomic_if_unchanged(&sch_path, &expected, &content)?;
