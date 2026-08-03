@@ -473,6 +473,60 @@ async fn handle_delete_schematic_component(
     }
 }
 
+/// Rewrite the designator inside a symbol's `(instances …)` path.
+///
+/// eeschema stores the reference twice: as a `(property "Reference" …)` and
+/// again inside `(instances (project … (path … (reference "R1"))))`. The
+/// instances copy is the one eeschema and kicad-cli treat as authoritative, so
+/// renaming only the property leaves the two disagreeing — the netlist keeps
+/// the old designator and the symbol's pins stop resolving against it, which
+/// silently drops the part from every net it was on.
+fn update_instance_reference(
+    content: &str,
+    reference: &str,
+    new_reference: &str,
+) -> Result<String, String> {
+    let (sym_start, sym_end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
+    let block = &content[sym_start..sym_end];
+    let inst_rel = block
+        .find("(instances")
+        .ok_or_else(|| format!("'{reference}' has no (instances …) block"))?;
+    let needle = format!("(reference \"{reference}\")");
+    let rel = block[inst_rel..].find(&needle).ok_or_else(|| {
+        format!("'{reference}' has no matching (reference …) under (instances …)")
+    })?;
+    let abs = sym_start + inst_rel + rel;
+    Ok(format!(
+        "{}(reference \"{}\"){}",
+        &content[..abs],
+        new_reference,
+        &content[abs + needle.len()..]
+    ))
+}
+
+/// Insert a new `(property "Key" "Value")` into a symbol block, ahead of its
+/// `(instances …)` node so the file keeps eeschema's ordering.
+fn insert_property(
+    content: &str,
+    reference: &str,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let (sym_start, sym_end) = find_symbol_instance_block(content, reference)
+        .ok_or_else(|| format!("symbol '{reference}' not found in this schematic"))?;
+    let block = &content[sym_start..sym_end];
+    let insert_rel = block
+        .find("(instances")
+        .unwrap_or_else(|| block.rfind(')').unwrap_or(block.len().saturating_sub(1)));
+    let abs = sym_start + insert_rel;
+    let prop = format!(
+        "    (property \"{key}\" \"{value}\"\n      (at 0 0 0)\n      \
+         (effects (font (size 1.27 1.27)) (hide yes))\n    )\n    "
+    );
+    Ok(format!("{}{}{}", &content[..abs], prop, &content[abs..]))
+}
+
 async fn handle_edit_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -524,7 +578,18 @@ async fn handle_edit_schematic_component(
         Err(why) => errors.push(format!("{field}: {why}")),
     };
 
+    // Deferred so it does not collide with `apply`'s mutable borrow of
+    // `errors`, which stays live across the remaining apply() calls.
+    let mut instance_error: Option<String> = None;
     if let Some(new_ref) = opt_str(args, "new_reference") {
+        // Rewrite the (instances …) copy FIRST: the block is located by its
+        // `(property "Reference" …)`, so the lookup still finds it under the
+        // old designator. Renaming only the property desynchronises the two
+        // and the symbol falls out of the netlist.
+        match update_instance_reference(&content, &reference, new_ref) {
+            Ok(updated) => content = updated,
+            Err(why) => instance_error = Some(format!("instances: {why}")),
+        }
         apply(&mut content, "Reference", new_ref);
     }
     if let Some(val) = opt_str(args, "value") {
@@ -535,6 +600,37 @@ async fn handle_edit_schematic_component(
     }
     if let Some(ds) = opt_str(args, "datasheet") {
         apply(&mut content, "Datasheet", ds);
+    }
+
+    if let Some(why) = instance_error {
+        errors.push(why);
+    }
+
+    // Arbitrary custom fields (MPN, LCSC, Manufacturer, …). The tool schema has
+    // always advertised `fields`, but the handler never read it — callers got a
+    // success response listing only the other changes while the field was
+    // silently dropped. Update in place when the property exists, insert it
+    // when it does not.
+    if let Some(map) = args.get("fields").and_then(|v| v.as_object()) {
+        for (key, raw) in map {
+            let Some(new_val) = raw.as_str() else {
+                errors.push(format!("{key}: value must be a string"));
+                continue;
+            };
+            match update_field(&content, &reference, key, new_val) {
+                Ok(updated) => {
+                    content = updated;
+                    changed.push(format!("{key} → {new_val}"));
+                }
+                Err(_) => match insert_property(&content, &reference, key, new_val) {
+                    Ok(updated) => {
+                        content = updated;
+                        changed.push(format!("{key} → {new_val} (added)"));
+                    }
+                    Err(why) => errors.push(format!("{key}: {why}")),
+                },
+            }
+        }
     }
 
     // A request that changed nothing is a failure, not a success — silently
@@ -1805,6 +1901,109 @@ mod tests {
         assert!(
             !val_sexp.contains("hide"),
             "Value stays visible: {val_sexp}"
+        );
+    }
+
+    /// Renaming must move BOTH copies of the designator. eeschema and
+    /// kicad-cli read the one under `(instances …)`; leaving it stale makes
+    /// the netlist keep the old name and drops the symbol's pins from every
+    /// net it was on, with no error surfaced anywhere.
+    #[tokio::test]
+    async fn rename_updates_instances_path_not_just_the_property() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rename.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(),
+                     "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let res = handle_edit_schematic_component(
+            &json!({ "schematic": path.display().to_string(),
+                     "reference": "R1", "new_reference": "R7" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "rename should succeed");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#"(reference "R7")"#),
+            "instances path must carry the new designator:\n{text}"
+        );
+        assert!(
+            !text.contains(r#"(reference "R1")"#),
+            "stale designator left under (instances …):\n{text}"
+        );
+    }
+
+    /// `fields` is advertised in the tool schema but was never read, so custom
+    /// properties (MPN, LCSC, Manufacturer) vanished while the call still
+    /// reported success.
+    #[tokio::test]
+    async fn edit_applies_custom_fields() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fields.kicad_sch");
+        let ctx = test_ctx();
+
+        handle_create_schematic(&json!({ "path": path.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        handle_add_schematic_component(
+            &json!({ "schematic": path.display().to_string(),
+                     "lib_id": "Device:R", "x": 100.0, "y": 100.0, "reference": "R1" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let res = handle_edit_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "fields": { "MPN": "0805W8F1002T5E", "LCSC": "C17414" } }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!res.is_error, "field edit should succeed");
+
+        let sym = cse::Schematic::load(&path).unwrap();
+        let r1 = sym
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("R1"))
+            .unwrap();
+        assert_eq!(r1.property("MPN"), Some("0805W8F1002T5E"));
+        assert_eq!(r1.property("LCSC"), Some("C17414"));
+
+        // An existing property is updated rather than duplicated.
+        handle_edit_schematic_component(
+            &json!({ "schematic": path.display().to_string(), "reference": "R1",
+                     "fields": { "MPN": "CHANGED" } }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let sym = cse::Schematic::load(&path).unwrap();
+        let r1 = sym
+            .symbols
+            .iter()
+            .find(|s| s.reference() == Some("R1"))
+            .unwrap();
+        assert_eq!(r1.property("MPN"), Some("CHANGED"));
+        assert_eq!(
+            r1.properties.iter().filter(|p| p.name == "MPN").count(),
+            1,
+            "updating must not append a second MPN property"
         );
     }
 }
