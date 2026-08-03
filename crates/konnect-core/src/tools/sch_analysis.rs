@@ -309,6 +309,15 @@ async fn handle_list_wires(
     ))
 }
 
+/// A power symbol carries its net name in `Value` (GND, +3V3, VCC).
+///
+/// Stock symbols live in the `power:` library; custom ones may not, so also
+/// accept the `#PWR`/`#FLG` reference convention eeschema uses for symbols
+/// excluded from the BOM.
+fn is_power_symbol(s: &cse::Symbol) -> bool {
+    s.lib_id.starts_with("power:") || s.reference().is_some_and(|r| r.starts_with('#'))
+}
+
 async fn handle_list_nets(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -321,6 +330,18 @@ async fn handle_list_nets(
         .map(|l| l.text.clone())
         .chain(sch.global_labels.iter().map(|l| l.text.clone()))
         .chain(sch.hierarchical_labels.iter().map(|l| l.text.clone()))
+        // Power symbols name a net just as much as a label does, and GND /
+        // +3V3 usually carry more pins than every label combined. They were
+        // omitted even though this tool's description promised them, so a
+        // schematic whose rails come only from power symbols reported those
+        // nets as simply absent — and every downstream net query returned
+        // null for the pins on them.
+        .chain(
+            sch.symbols
+                .iter()
+                .filter(|s| is_power_symbol(s))
+                .filter_map(|s| s.property("Value").map(str::to_string)),
+        )
         .collect();
     nets.sort();
     nets.dedup();
@@ -835,4 +856,77 @@ async fn handle_check_overlaps(
     Ok(CallToolResult::json(
         &json!({ "overlap_count": all.len(), "overlaps": all }),
     ))
+}
+
+#[cfg(test)]
+mod power_net_tests {
+    use super::*;
+    use crate::router::ToolRouter;
+    use crate::tools::ServerConfig;
+    use std::sync::Arc;
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
+
+    /// One net label plus two power symbols. Most real schematics name GND and
+    /// the supply rail only through power symbols, never a label.
+    // r##..##: the reference values contain `"#`, which would close an r#".."# literal.
+    const SCH: &str = r##"(kicad_sch
+  (version 20241209)
+  (generator "test")
+  (uuid "00000000-0000-0000-0000-000000000001")
+  (label "SPI_CLK" (at 50 50 0) (uuid "00000000-0000-0000-0000-000000000002"))
+  (symbol
+    (lib_id "power:GND")
+    (at 100 100 0)
+    (unit 1)
+    (uuid "00000000-0000-0000-0000-000000000003")
+    (property "Reference" "#PWR01")
+    (property "Value" "GND")
+  )
+  (symbol
+    (lib_id "power:+3V3")
+    (at 120 100 0)
+    (unit 1)
+    (uuid "00000000-0000-0000-0000-000000000004")
+    (property "Reference" "#PWR02")
+    (property "Value" "+3V3")
+  )
+)
+"##;
+
+    #[tokio::test]
+    async fn list_nets_includes_power_symbol_nets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("power.kicad_sch");
+        std::fs::write(&path, SCH).unwrap();
+
+        let res = handle_list_nets(
+            &json!({ "schematic": path.display().to_string() }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let body = format!("{:?}", res);
+
+        assert!(body.contains("SPI_CLK"), "label net missing: {body}");
+        assert!(
+            body.contains("GND"),
+            "power symbol net GND missing — the tool documents power symbols as a source: {body}"
+        );
+        assert!(
+            body.contains("+3V3"),
+            "power symbol net +3V3 missing: {body}"
+        );
+    }
 }
