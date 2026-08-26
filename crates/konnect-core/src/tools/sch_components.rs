@@ -594,15 +594,23 @@ fn update_instance_reference(
         .find("(instances")
         .ok_or_else(|| format!("'{reference}' has no (instances …) block"))?;
     let needle = format!("(reference \"{reference}\")");
-    let rel = block[inst_rel..].find(&needle).ok_or_else(|| {
-        format!("'{reference}' has no matching (reference …) under (instances …)")
-    })?;
-    let abs = sym_start + inst_rel + rel;
+    let inst_abs = sym_start + inst_rel;
+    let instances = &content[inst_abs..sym_end];
+    if !instances.contains(&needle) {
+        return Err(format!(
+            "'{reference}' has no matching (reference …) under (instances …)"
+        ));
+    }
+    // A symbol carries one (project …) block per project that instantiates its
+    // sheet, and a sheet reused from a standalone project keeps that project's
+    // block too. Rewriting only the first leaves the others disagreeing, and
+    // the netlist reads whichever path it resolves — so replace every copy.
+    let rewritten = instances.replace(&needle, &format!("(reference \"{new_reference}\")"));
     Ok(format!(
-        "{}(reference \"{}\"){}",
-        &content[..abs],
-        new_reference,
-        &content[abs + needle.len()..]
+        "{}{}{}",
+        &content[..inst_abs],
+        rewritten,
+        &content[sym_end..]
     ))
 }
 
@@ -1555,6 +1563,32 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains(&format!("/{}", root_uuid)));
         assert!(raw.contains("(unit 3)"), "instance unit must be 3");
+    }
+
+    /// A sheet reused from a standalone project carries two (project …) blocks
+    /// per symbol. Renaming must rewrite the designator in *both*: the netlist
+    /// reads the hierarchy path, so updating only the first silently leaves the
+    /// old name live and merges two parts onto one refdes.
+    #[test]
+    fn update_instance_reference_rewrites_every_project_block() {
+        let content = "\t(symbol\n\t\t(lib_id \"granny:ICN6211\")\n\t\t(at 1 2 0)\n\
+             \t\t(property \"Reference\" \"U1\"\n\t\t\t(at 0 0 0)\n\t\t)\n\
+             \t\t(instances\n\
+             \t\t\t(project \"DISPLAY\"\n\t\t\t\t(path \"/aaaa\"\n\t\t\t\t\t(reference \"U1\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+             \t\t\t(project \"root\"\n\t\t\t\t(path \"/aaaa/bbbb\"\n\t\t\t\t\t(reference \"U1\")\n\t\t\t\t\t(unit 1)\n\t\t\t\t)\n\t\t\t)\n\
+             \t\t)\n\t)\n";
+
+        let out = update_instance_reference(content, "U1", "U9").unwrap();
+
+        assert_eq!(
+            out.matches("(reference \"U9\")").count(),
+            2,
+            "both project blocks must be rewritten:\n{out}"
+        );
+        assert!(
+            !out.contains("(reference \"U1\")"),
+            "no stale designator may survive:\n{out}"
+        );
     }
 
     fn content_text(res: &CallToolResult) -> String {
