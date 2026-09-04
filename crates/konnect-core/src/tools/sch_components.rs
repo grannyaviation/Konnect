@@ -444,12 +444,59 @@ pub(crate) fn place_one_component(
         0.0,
         hide_reference,
     ));
+    // Copy the library symbol's own fields onto the instance, the way eeschema
+    // does when you place a part. Without this the instance carries an empty
+    // Footprint -- so the part never reaches the board -- and a Value equal to
+    // the symbol name rather than the part's actual value, which makes the BOM
+    // meaningless. Any BOM metadata the library carries (Manufacturer, MPN,
+    // distributor links, ...) is copied too.
+    //
+    // Uses the flattened node so a derived symbol (`(extends ...)`) inherits
+    // its parent's fields. `ki_*` properties are library-only metadata that
+    // eeschema does not copy onto instances, so they are skipped.
+    let lib_fields: Vec<(String, String)> = cse::library::resolve_lib_symbol_flattened_node(lib_id)
+        .map(|node| {
+            node.find_all("property")
+                .iter()
+                .filter_map(|p| {
+                    let a = p.scalar_args();
+                    Some((a.first()?.to_string(), a.get(1)?.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let lib_field = |name: &str| -> &str {
+        lib_fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
+
+    // An explicit `value` argument wins; otherwise take the library's Value,
+    // falling back to the bare symbol name only when the library has none.
+    let val_str = match value {
+        Some(v) => v,
+        None => {
+            let lv = lib_field("Value");
+            if lv.is_empty() { val_str } else { lv }
+        }
+    };
+
     sym.properties
         .push(positioned("Value", val_str, x, y + 3.81, 0.0, false));
     sym.properties
-        .push(positioned("Footprint", "", x, y, 0.0, true));
+        .push(positioned("Footprint", lib_field("Footprint"), x, y, 0.0, true));
     sym.properties
-        .push(positioned("Datasheet", "", x, y, 0.0, true));
+        .push(positioned("Datasheet", lib_field("Datasheet"), x, y, 0.0, true));
+    for (k, v) in &lib_fields {
+        if matches!(k.as_str(), "Reference" | "Value" | "Footprint" | "Datasheet")
+            || k.starts_with("ki_")
+        {
+            continue;
+        }
+        sym.properties.push(positioned(k, v, x, y, 0.0, true));
+    }
 
     // Instance entry, keyed to the root sheet UUID like eeschema writes it:
     // (instances (project "<name>" (path "/<root-uuid>" (reference ...) (unit 1))))
@@ -1448,6 +1495,13 @@ mod tests {
             )
         };
         std::fs::write(symdir.join("R.kicad_sym"), symbol("R")).unwrap();
+        // A symbol carrying the full BOM field set, to prove placement copies
+        // library fields onto the instance rather than writing blanks.
+        std::fs::write(
+            symdir.join("FIELDED.kicad_sym"),
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"FIELDED\"\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"REALVALUE\" (at 0 0 0))\n\t\t(property \"Footprint\" \"granny:REALFP\" (at 0 0 0))\n\t\t(property \"MPN\" \"REALMPN\" (at 0 0 0))\n\t\t(property \"ki_keywords\" \"kw\" (at 0 0 0))\n\t\t(symbol \"FIELDED_0_1\"\n\t\t\t(pin passive line (at 0 3.81 270) (length 1.27)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+        )
+        .unwrap();
         std::fs::write(symdir.join("C_Polarized.kicad_sym"), symbol("C_Polarized")).unwrap();
         // LM2904-style multi-unit part: unit 1 = pins 1-3, unit 2 = pins 5-7,
         // unit 3 = power pins 4/8 (#35 repro shape).
@@ -1588,6 +1642,49 @@ mod tests {
         assert!(
             !out.contains("(reference \"U1\")"),
             "no stale designator may survive:\n{out}"
+        );
+    }
+
+    /// eeschema copies a symbol's library fields onto the instance when you
+    /// place it. Without that, the instance carries an empty Footprint -- so
+    /// the part never reaches the board -- and a Value equal to the symbol
+    /// name, which makes the BOM meaningless.
+    #[tokio::test]
+    async fn placement_copies_library_fields_onto_the_instance() {
+        let (_symdir, _env) = stub_symbol_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (uuid \"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))",
+        )
+        .unwrap();
+
+        handle_add_schematic_component(
+            &json!({ "schematic": path.to_str().unwrap(), "lib_id": "Device:FIELDED",
+                     "x": 100.0, "y": 100.0, "reference": "U1" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        let inst = &out[out.rfind("(lib_id \"Device:FIELDED\")").unwrap()..];
+        assert!(
+            inst.contains("(property \"Footprint\" \"granny:REALFP\""),
+            "Footprint must come from the library, not be blank:\n{inst}"
+        );
+        assert!(
+            inst.contains("(property \"Value\" \"REALVALUE\""),
+            "Value must come from the library, not the symbol name:\n{inst}"
+        );
+        assert!(
+            inst.contains("(property \"MPN\" \"REALMPN\""),
+            "BOM fields must be carried onto the instance:\n{inst}"
+        );
+        assert!(
+            !inst.contains("ki_keywords"),
+            "ki_* fields are library-only and must not be copied:\n{inst}"
         );
     }
 
