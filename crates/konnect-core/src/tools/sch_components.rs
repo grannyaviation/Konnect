@@ -454,7 +454,15 @@ pub(crate) fn place_one_component(
     // Uses the flattened node so a derived symbol (`(extends ...)`) inherits
     // its parent's fields. `ki_*` properties are library-only metadata that
     // eeschema does not copy onto instances, so they are skipped.
-    let lib_fields: Vec<(String, String)> = cse::library::resolve_lib_symbol_flattened_node(lib_id)
+    //
+    // Resolve against the schematic's own directory, exactly as
+    // `ensure_lib_symbol` does above. The env-based variant reads
+    // KONNECT_PROJECT_DIR, which is unset in a plain MCP server process, so a
+    // project-scoped `${KIPRJMOD}` lib_id resolved to None and every field
+    // below silently came back empty.
+    let project_dir = sch.filepath().parent().map(|p| p.to_path_buf());
+    let lib_fields: Vec<(String, String)> =
+        cse::library::resolve_lib_symbol_flattened_node_in(project_dir.as_deref(), lib_id)
         .map(|node| {
             node.find_all("property")
                 .iter()
@@ -1685,6 +1693,70 @@ mod tests {
         assert!(
             !inst.contains("ki_keywords"),
             "ki_* fields are library-only and must not be copied:\n{inst}"
+        );
+    }
+
+    /// The same field copy, but for a library reached through the project's
+    /// own `sym-lib-table` (`${KIPRJMOD}`) rather than KICAD10_SYMBOL_DIR.
+    ///
+    /// This is the path every part in a real project takes, and the first cut
+    /// of the fix silently failed it: it resolved via KONNECT_PROJECT_DIR,
+    /// which a plain MCP server process never sets, so the lookup returned
+    /// None and every field landed empty -- exactly the blank Footprint the
+    /// fix was written to prevent. The stub-library test above could not catch
+    /// it because a global library resolves with no project dir at all.
+    #[tokio::test]
+    async fn placement_copies_fields_from_a_project_scoped_library() {
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(
+            proj.path().join("granny.kicad_sym"),
+            "(kicad_symbol_lib\n  (symbol \"PROJPART\"\n\
+             (property \"Reference\" \"J\")\n\
+             (property \"Value\" \"691325110006\")\n\
+             (property \"Footprint\" \"granny:Wurth_691325110006\")\n\
+             (property \"MPN\" \"691325110006\")\n\
+             (property \"ki_keywords\" \"terminal block\")\n\
+             (symbol \"PROJPART_0_1\")\n  )\n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.path().join("sym-lib-table"),
+            "(sym_lib_table\n  (lib (name \"granny\") (type \"KiCad\") \
+             (uri \"${KIPRJMOD}/granny.kicad_sym\") (options \"\") (descr \"\"))\n)\n",
+        )
+        .unwrap();
+
+        // Deliberately NOT set: the server process does not have it either.
+        unsafe { std::env::remove_var("KONNECT_PROJECT_DIR") };
+
+        let path = proj.path().join("t.kicad_sch");
+        std::fs::write(
+            &path,
+            "(kicad_sch (version 20250114) (generator \"eeschema\") (uuid \"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\") (paper \"A4\") (lib_symbols) (sheet_instances (path \"/\" (page \"1\"))))",
+        )
+        .unwrap();
+
+        handle_add_schematic_component(
+            &json!({ "schematic": path.to_str().unwrap(), "lib_id": "granny:PROJPART",
+                     "x": 30.0, "y": 50.0, "reference": "J3" }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        let inst = &out[out.rfind("(lib_id \"granny:PROJPART\")").unwrap()..];
+        assert!(
+            inst.contains("(property \"Footprint\" \"granny:Wurth_691325110006\""),
+            "an empty Footprint means the part never reaches the PCB:\n{inst}"
+        );
+        assert!(
+            inst.contains("(property \"Value\" \"691325110006\""),
+            "Value must come from the library, not the symbol name:\n{inst}"
+        );
+        assert!(
+            inst.contains("(property \"MPN\" \"691325110006\""),
+            "BOM fields must be carried onto the instance:\n{inst}"
         );
     }
 
