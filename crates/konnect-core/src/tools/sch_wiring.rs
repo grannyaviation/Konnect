@@ -264,6 +264,27 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_batch_delete_no_connect(args, ctx).await }
         ),
         tool!(
+            "batch_add_no_connect",
+            "Add multiple no-connect flags in a single file read/write cycle. \
+             Positions that already carry a flag are skipped, so the call is \
+             idempotent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "positions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } }
+                        }
+                    }
+                },
+                "required": ["schematic", "positions"]
+            }),
+            |args, ctx| async move { handle_batch_add_no_connect(args, ctx).await }
+        ),
+        tool!(
             "add_junction",
             "Add a junction dot at a point where wires cross or T-intersect, or where \
              a pin lands mid-wire. A junction alone connects a mid-wire pin; \
@@ -1339,6 +1360,53 @@ async fn handle_add_no_connect(
     ))
 }
 
+/// [`handle_add_no_connect`] for many points, one read and one write.
+///
+/// A sheet full of unused IC pins needs dozens of these; calling the
+/// single-point tool that many times rewrites the file once per flag. Skips
+/// points that already carry a flag so a repeated call is a no-op rather than
+/// a way to stack duplicate markers on one pin.
+async fn handle_batch_add_no_connect(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let positions = args["positions"].as_array().cloned().unwrap_or_default();
+
+    let existing = read_consistent(&sch_path)?;
+    let mut sch = cse::Schematic::load(&sch_path)?;
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen: Vec<(f64, f64)> = Vec::new();
+
+    for pos in &positions {
+        let (Some(x), Some(y)) = (pos["x"].as_f64(), pos["y"].as_f64()) else {
+            errors.push(format!("Position {pos} needs numeric x and y"));
+            continue;
+        };
+        let dup = seen
+            .iter()
+            .any(|(sx, sy)| (sx - x).abs() <= 1e-6 && (sy - y).abs() <= 1e-6);
+        if dup || find_no_connect_block_at(&existing, x, y).is_some() {
+            skipped += 1;
+            continue;
+        }
+        seen.push((x, y));
+        sch.add_no_connect(x, y);
+        added += 1;
+    }
+
+    if added > 0 {
+        sch.overwrite()?;
+    }
+    Ok(CallToolResult::json(&json!({
+        "added": added,
+        "skipped": skipped,
+        "errors": errors
+    })))
+}
+
 async fn handle_delete_no_connect(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -2392,6 +2460,53 @@ mod no_connect_delete_tests {
         )
         .unwrap();
         (dir, path)
+    }
+
+    #[tokio::test]
+    async fn batch_add_no_connect_adds_new_and_skips_existing() {
+        let (_d, path) = schematic_with_two_no_connects();
+        let result = handle_batch_add_no_connect(
+            &json!({ "schematic": path.display().to_string(), "positions": [
+                { "x": 127.0, "y": 63.5 },   // already present -> skip
+                { "x": 200.0, "y": 100.0 },  // new
+                { "x": 210.0, "y": 100.0 },  // new
+                { "x": 210.0, "y": 100.0 },  // duplicate within the call -> skip
+                { "x": 1.0 }                 // malformed -> error, not a flag
+            ]}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let text_of = |r: &CallToolResult| match &r.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let out = text_of(&result);
+        assert!(out.contains("\"added\":2"), "expected 2 added, got {out}");
+        assert!(out.contains("\"skipped\":2"), "expected 2 skipped, got {out}");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("(no_connect").count(),
+            4,
+            "two originals plus two new, no duplicate on the existing point:\n{text}"
+        );
+
+        // Idempotent: running it again must add nothing.
+        let again = handle_batch_add_no_connect(
+            &json!({ "schematic": path.display().to_string(), "positions": [
+                { "x": 200.0, "y": 100.0 }, { "x": 210.0, "y": 100.0 }
+            ]}),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        assert!(text_of(&again).contains("\"added\":0"), "{again:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().matches("(no_connect").count(),
+            4
+        );
     }
 
     #[tokio::test]
