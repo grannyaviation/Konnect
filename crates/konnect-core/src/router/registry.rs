@@ -38,9 +38,9 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_bus",
-        description: "Buses, bus entries, and fanning a group of pins out onto a bus",
+        description: "Buses, bus entries, bus aliases, and fanning a group of pins out onto a bus",
         category: "schematic",
-        tool_count: 4,
+        tool_count: 7,
     },
     ToolsetMeta {
         name: "sch_analysis",

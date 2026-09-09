@@ -1129,7 +1129,9 @@ pub fn format_sheet_pin(
     )
 }
 
-fn escape_quoted_text(value: &str) -> String {
+/// Escape a value for a KiCad quoted string. Public so callers that format
+/// their own nodes (bus aliases, for one) escape identically to this crate.
+pub fn escape_quoted_text(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **221 registered tools** + **7 always-visible meta-tools** = **228 total**
+- **225 registered tools** + **7 always-visible meta-tools** = **232 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -119,8 +119,8 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `connect_pins` | Connect two component pins by reference+pin number. Looks up pin coordinates and routes a wire. |
 | `add_schematic_connection` | Connect two schematic points directly with a wire (auto H+V routing). Use `connect_pins` if you have references instead of coordinates. |
 
-### `sch_bus` · 4 tools
-**Purpose:** Buses, bus entries, and fanning a group of pins out onto a bus.
+### `sch_bus` · 7 tools
+**Purpose:** Buses, bus entries, bus aliases, and fanning a group of pins out onto a bus.
 **Source:** [`crates/konnect-core/src/tools/sch_bus.rs`](crates/konnect-core/src/tools/sch_bus.rs)
 
 | Tool | Description |
@@ -129,6 +129,9 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `batch_add_bus` | Add multiple bus segments in one file read/write cycle. |
 | `add_bus_entry` | Add the 45° tick that connects a wire to a bus. Required — a wire and bus that merely touch are *not* connected. `x`/`y` are the wire-side end; `direction` picks which corner the tick runs to (`down_right` default, `down_left`, `up_right`, `up_left`). |
 | `connect_pins_to_bus` | Fan a set of pins onto a bus: wire stub + bus entry + member label per pin. Bus membership is by name, so the label is part of the connection, not decoration. |
+| `add_bus_alias` | Define `(bus_alias "NAME" (members …))` on a sheet, so a label or sheet pin can name the whole bundle as `PREFIX{NAME}` and KiCad expands it to one `PREFIX.MEMBER` net per member. Written after `lib_symbols`, where eeschema writes it. Idempotent: redefining a name replaces that block rather than leaving two definitions of one alias. |
+| `list_bus_aliases` | List the aliases defined in a sheet and, by default, every sheet below it — with which file defines each, since eeschema's Bus Aliases dialog only shows the sheet currently open. |
+| `validate_bus_aliases` | Check every `PREFIX{ALIAS}` label and sheet pin in the hierarchy against the aliases actually defined in it. Catches an alias referenced but defined nowhere — which KiCad does **not** flag: it reads the label as a one-member group and nets up `PREFIX.ALIAS`, so the schematic looks right and the netlist is wrong. Also reports one alias defined twice with different members. Read-only. |
 
 ### `sch_analysis` · 15 tools
 **Purpose:** Net connectivity, pin queries, trace paths, overlap/orphan detection.
@@ -152,7 +155,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `get_connected_items` | Get all wires, labels, and components connected to a given component by tracing each of its pins. |
 | `check_schematic_overlaps` | Find collisions using transformed symbol drawings and pins (excluding free text), with a reported origin fallback when geometry is unavailable. |
 
-### `sch_batch` · 12 tools
+### `sch_batch` · 13 tools
 **Purpose:** Bulk add, edit, delete, and move schematic elements in one call.
 **Source:** [`crates/konnect-core/src/tools/sch_batch.rs`](crates/konnect-core/src/tools/sch_batch.rs)
 
@@ -170,6 +173,7 @@ Seven tools, grouped into *discovery/routing*, *observability*, and *runtime dia
 | `validate_component_connections` | Check that every non-passive pin has at least one wire or label connected. Reports unconnected pins. |
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Preserves every saved hierarchy instance and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
+| `prune_unused_lib_symbols` | Remove cached `lib_symbols` definitions no placed instance references. Orphans accumulate whenever a symbol is renamed or swapped — eeschema never prunes them and kicad-cli preserves them verbatim. Netlist-neutral. |
 
 ### `sch_export` · 10 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
