@@ -743,6 +743,14 @@ fn split_group_bus(label: &str) -> Option<(&str, &str)> {
             b'{' => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
+                    // `~{X}`, `_{X}`, `^{X}` are KiCad TEXT MARKUP — overbar,
+                    // subscript, superscript — not a bus. Active-low names
+                    // like `~{RESET}` and `~{CS_ACCEL}` are ordinary nets, and
+                    // reading them as group buses invents aliases nothing
+                    // defines.
+                    if i > 0 && matches!(bytes[i - 1], b'~' | b'_' | b'^') {
+                        return None;
+                    }
                     return Some((&label[..i], &label[i + 1..bytes.len() - 1]));
                 }
             }
@@ -1113,6 +1121,19 @@ mod tests {
         assert_eq!(split_group_bus("{A B C}"), Some(("", "A B C")));
         assert_eq!(split_group_bus("SPI6_MOSI"), None);
         assert_eq!(split_group_bus("X_DIG[1..6]"), None);
+    }
+
+    /// Active-low names are markup, not buses. Found by running the check over
+    /// a real board: `~{RESET}`, `~{CS_ACCEL}` and four more were reported as
+    /// references to aliases nothing defines.
+    #[test]
+    fn text_markup_is_not_a_group_bus() {
+        for markup in ["~{RESET}", "~{CS_ACCEL}", "~{GPS_SAFEBOOT}", "_{sub}", "^{sup}"] {
+            assert_eq!(split_group_bus(markup), None, "{markup} is markup");
+            assert_eq!(alias_reference(markup), None, "{markup} names no alias");
+        }
+        // A name may still END in markup and carry a real group before it.
+        assert_eq!(alias_reference("I_{2}C1{I_{2}C}"), Some("I_{2}C"));
     }
 
     /// An inner token with whitespace is an explicit member list, not an alias.
