@@ -21,11 +21,17 @@
 //!   - alias   `DSI1{DSI}`     — members come from a `(bus_alias "DSI" …)`
 //!     defined once anywhere in the hierarchy, expanding to `DSI1.D0_P` etc.
 //!
-//! The alias form is the one that fails silently. eeschema's Schematic Setup →
-//! Bus Aliases dialog edits **only the sheet you have open**, and a reference
-//! to an alias no sheet defines is not an error: KiCad reads `DSI1{DSI}` as a
-//! one-member group and nets up `DSI1.DSI`. The schematic looks right, the
-//! netlist is wrong. `validate_bus_aliases` is the check for exactly that.
+//! eeschema's Schematic Setup → Bus Aliases dialog edits **only the sheet you
+//! have open**, so in a hierarchy it is easy to reference an alias that no
+//! sheet defines. KiCad *does* catch that — measured on a real design, ERC
+//! answers with `net_not_bus_member` and `isolated_pin_label`, and the bundle
+//! stops crossing the sheet boundary, splitting into per-sheet nets rather
+//! than being renamed. What it does not do is name the alias, name the file,
+//! or say which of many labels is at fault; 64 violations of two generic kinds
+//! is a worse starting point than one line saying `DSI` is defined nowhere.
+//! `validate_bus_aliases` is that line, plus the two things ERC has no opinion
+//! about: one alias defined twice with different members, and aliases defined
+//! but never used.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -186,10 +192,11 @@ pub fn tools() -> Vec<ToolDef> {
             "validate_bus_aliases",
             "Check every 'PREFIX{ALIAS}' label, global label, hierarchical label and sheet pin in \
              the hierarchy against the aliases actually defined in it. Reports an alias referenced \
-             but defined nowhere -- which KiCad does NOT flag, it silently nets up a one-member \
-             group named after the alias -- and the same alias defined in two files with different \
-             members. Aliases defined but never used are listed separately, as information rather \
-             than a fault. Read-only.",
+             but defined nowhere, naming the alias and the file -- ERC does catch that case, but \
+             as a scatter of net_not_bus_member and isolated_pin_label violations that name \
+             neither. Also reports the same alias defined in two files with different members, \
+             which ERC has no opinion about. Aliases defined but never used are listed separately, \
+             as information rather than a fault. Read-only.",
             json!({
                 "type": "object",
                 "properties": {
@@ -659,9 +666,9 @@ async fn handle_validate_bus_aliases(
         }
     }
 
-    // The silent one: a reference to an alias nothing defines. KiCad does not
-    // report it — it reads `PREFIX{ALIAS}` as a one-member group and nets up
-    // `PREFIX.ALIAS`.
+    // A reference to an alias nothing defines. ERC does catch this, as
+    // `net_not_bus_member` + `isolated_pin_label`, but it names neither the
+    // alias nor the file — this does.
     let mut unresolved: BTreeMap<&str, Vec<&AliasUse>> = BTreeMap::new();
     for use_site in &uses {
         if !by_name.contains_key(&use_site.alias) {
@@ -679,9 +686,9 @@ async fn handle_validate_bus_aliases(
                 "label": u.label, "file": u.file, "item": u.kind
             })).collect::<Vec<_>>(),
             "why": format!(
-                "no sheet in this hierarchy defines '{alias}'. KiCad does not flag that: it reads \
-                 the label as a one-member group and nets up 'PREFIX.{alias}'. The schematic looks \
-                 right and the netlist is wrong."
+                "no sheet in this hierarchy defines '{alias}', so the bundle stops crossing the \
+                 sheet boundary and splits into per-sheet nets. ERC reports this as \
+                 net_not_bus_member and isolated_pin_label without naming the alias or the file."
             )
         }));
     }
@@ -1285,8 +1292,10 @@ mod tests {
         assert_eq!(response["issue_count"], 0, "{response}");
     }
 
-    /// The whole point: KiCad reports nothing here, it just nets up
-    /// `DSI1.DSI` and the netlist is quietly wrong.
+    /// ERC does catch an undefined alias — measured on the cm4-baseboard
+    /// reference, renaming one alias definition adds 32 net_not_bus_member and
+    /// 32 isolated_pin_label violations. It names neither the alias nor the
+    /// file; this does.
     #[tokio::test]
     async fn an_alias_nothing_defines_is_reported() {
         let (_dir, root) = hierarchy_using(false);
