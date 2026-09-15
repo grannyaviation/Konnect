@@ -1133,11 +1133,11 @@ async fn handle_import_sheet_pins(
     let mut parent = cse::Schematic::load(&sch_path)?;
     let dir = parent_dir(&sch_path);
 
-    let (child_path, sheet_x, sheet_y, sheet_w, existing_pin_count) =
+    let (child_path, sheet_x, sheet_y, sheet_w, sheet_h) =
         match parent.sheets.by_name(&sheet_name) {
             Some(s) => {
                 let (x, y) = s.position();
-                (dir.join(s.file()), x, y, s.width, s.pins.len())
+                (dir.join(s.file()), x, y, s.width, s.height)
             }
             None => {
                 return Ok(CallToolResult::error(format!(
@@ -1180,7 +1180,16 @@ async fn handle_import_sheet_pins(
 
     let mut imported = Vec::new();
     let mut skipped_existing = Vec::new();
-    let mut slot = existing_pin_count;
+    let mut outside_sheet_box = Vec::new();
+    // Stack below the lowest pin already on *this* edge. Counting every pin on
+    // the sheet (both edges, gaps from deleted pins included) put new pins on
+    // top of existing ones, which shorts their nets once labelled.
+    let mut y = sheet
+        .pins
+        .iter()
+        .filter(|p| (p.at.x - edge_x).abs() < 1e-3)
+        .map(|p| p.at.y)
+        .fold(sheet_y, f64::max);
     for (name, shape) in label_names {
         if sheet.pin_by_name(&name).is_some() {
             skipped_existing.push(name);
@@ -1191,10 +1200,13 @@ async fn handle_import_sheet_pins(
         } else {
             "passive".to_string()
         };
-        slot += 1;
-        let y = sheet_y + SHEET_PIN_SPACING_MM * slot as f64;
+        y += SHEET_PIN_SPACING_MM;
         let mut pin = cse::SheetPin::new(name.as_str(), pin_type.as_str(), edge_x, y);
         pin.at.rotation = Some(rotation);
+        if y > sheet_y + sheet_h + 1e-3 {
+            // A pin outside its own sheet box does not connect in kicad-cli's netlist.
+            outside_sheet_box.push(pin.name.clone());
+        }
         imported.push(pin.name.clone());
         sheet.add_pin(pin);
     }
@@ -1212,7 +1224,8 @@ async fn handle_import_sheet_pins(
     Ok(CallToolResult::json(&json!({
         "sheet": sheet_name,
         "imported_pins": imported,
-        "skipped_existing": skipped_existing
+        "skipped_existing": skipped_existing,
+        "outside_sheet_box": outside_sheet_box
     })))
 }
 
@@ -2265,6 +2278,49 @@ mod tests {
 
         let parent = cse::Schematic::load(&root).unwrap();
         assert_eq!(parent.sheets.by_name("Power").unwrap().pins.len(), 1); // not duplicated
+    }
+
+    #[tokio::test]
+    async fn import_sheet_pins_never_lands_on_an_existing_pin() {
+        // Regression (sensor_board#37): after deleting a pin, the next import
+        // counted pins instead of reading their positions and stacked the new
+        // pin on top of one that was still there.
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        handle_add_hierarchical_sheet(
+            &json!({ "schematic": root.display().to_string(), "sheet_file": "p.kicad_sch", "sheet_name": "P" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let child_path = tmp.path().join("p.kicad_sch");
+        for (i, name) in ["A", "B", "C"].iter().enumerate() {
+            add_label(&child_path, name, "input", 5.0, 5.0 + i as f64 * 2.54);
+        }
+        let r = json!({ "schematic": root.display().to_string(), "sheet_name": "P" });
+        handle_import_sheet_pins(&r, &ctx).await.unwrap();
+        handle_delete_sheet_pin(
+            &json!({ "schematic": root.display().to_string(), "sheet_name": "P", "pin_name": "A" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        add_label(&child_path, "D", "input", 5.0, 20.0);
+        handle_import_sheet_pins(&r, &ctx).await.unwrap(); // re-imports A and adds D
+
+        let parent = cse::Schematic::load(&root).unwrap();
+        let pins = &parent.sheets.by_name("P").unwrap().pins;
+        assert_eq!(pins.len(), 4);
+        for (i, a) in pins.iter().enumerate() {
+            for b in &pins[i + 1..] {
+                assert!(
+                    (a.at.x - b.at.x).abs() > 1e-3 || (a.at.y - b.at.y).abs() > 1e-3,
+                    "{} and {} share ({}, {})",
+                    a.name, b.name, a.at.x, a.at.y
+                );
+            }
+        }
     }
 
     #[tokio::test]

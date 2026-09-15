@@ -3556,31 +3556,15 @@ async fn handle_delete_symbol(
 
     let content = tokio::fs::read_to_string(&lib_path).await?;
 
-    // Find `  (symbol "NAME"` block
-    let pat = format!(r#"  (symbol "{}""#, symbol_name);
-    let start = content
-        .find(&pat)
-        .ok_or_else(|| anyhow::anyhow!("Symbol '{}' not found in library", symbol_name))?;
+    // The old fixed search for `  (symbol "NAME"` (two spaces) never matched a
+    // KiCad-written, TAB-indented library, so delete_symbol answered "not found"
+    // for names list_symbols_in_library returns (sensor_board#38).
+    let Some((start, end)) = top_level_symbol_span(&content, symbol_name) else {
+        return Err(anyhow::anyhow!("Symbol '{}' not found in library", symbol_name));
+    };
 
     // Walk back to find preceding newline
     let block_start = content[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-
-    // Walk forward to find end of block (depth count)
-    let mut depth = 0i32;
-    let mut end = start;
-    for (i, ch) in content[start..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = start + i + 1;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
     // Skip trailing newline
     let end = if content[end..].starts_with('\n') {
         end + 1
@@ -3598,6 +3582,50 @@ async fn handle_delete_symbol(
         }))
         .unwrap(),
     ))
+}
+
+/// Byte span `(start, end)` of the top-level `(symbol "NAME" …)` form — a direct
+/// child of `(kicad_symbol_lib …)` — whatever the indentation. Quoted strings
+/// (with `\"` escapes) are skipped, so a parenthesis inside a property value
+/// cannot end the block early; unit sub-symbols (`NAME_0_1`) are never matched.
+fn top_level_symbol_span(content: &str, name: &str) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let head = format!("(symbol \"{}\"", name);
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut start = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            match c {
+                b'\\' => i += 1,
+                b'"' => in_str = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'(' => {
+                    if depth == 1 && start.is_none() && content[i..].starts_with(&head) {
+                        start = Some(i);
+                    }
+                    depth += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 1 {
+                        if let Some(s) = start {
+                            return Some((s, i + 1));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract the names of every top-level symbol defined in a `.kicad_sym`
@@ -4109,6 +4137,29 @@ mod tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn delete_symbol_finds_tab_indented_symbols_and_ignores_parens_in_strings() {
+        // Regression (sensor_board#38): a KiCad-written library is TAB-indented,
+        // and the old two-space search answered "not found".
+        let lib = "(kicad_symbol_lib\n\t(version 20251024)\n\
+\t(symbol \"A\"\n\t\t(property \"Description\" \"has ) paren\")\n\t\t(symbol \"A_0_1\")\n\t)\n\
+\t(symbol \"B_X\"\n\t\t(property \"Description\" \"quote \\\" and (\")\n\t\t(symbol \"B_X_1_1\")\n\t)\n\
+\t(symbol \"C\")\n)\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.kicad_sym");
+        std::fs::write(&path, lib).unwrap();
+        let args = json!({ "library_path": path.display().to_string(), "symbol_name": "B_X" });
+        let r = handle_delete_symbol(&args, &test_ctx()).await.unwrap();
+        assert!(!r.is_error);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(!out.contains("B_X"), "{out}");
+        assert!(out.contains("(symbol \"A\"") && out.contains("has ) paren") && out.contains("(symbol \"C\")"), "{out}");
+        assert!(out.trim_end().ends_with(')'));
+        // A unit sub-symbol name is not a top-level symbol.
+        let args = json!({ "library_path": path.display().to_string(), "symbol_name": "A_0_1" });
+        assert!(handle_delete_symbol(&args, &test_ctx()).await.is_err());
     }
 
     /// A lib-table in the exact shape KiCad writes it: CRLF-terminated and
