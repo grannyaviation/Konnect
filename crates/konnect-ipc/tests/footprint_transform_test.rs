@@ -442,3 +442,200 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
     assert_eq!(placements, vec![(50.0, 50.0, 90.0), (250.0, 150.0, 180.0)]);
     assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
 }
+
+// ─── FlipItems (PixelCad) ───────────────────────────────────────────────────
+
+type CapturedFlip = Arc<Mutex<Option<kiapi::board::commands::FlipItems>>>;
+
+fn with_identity(
+    mut footprint: kiapi::board::types::FootprintInstance,
+    reference: &str,
+    id: &str,
+    layer: kiapi::board::types::BoardLayer,
+) -> kiapi::board::types::FootprintInstance {
+    footprint.id = Some(kiapi::common::types::Kiid {
+        value: id.to_string(),
+    });
+    footprint.layer = layer as i32;
+    footprint
+        .reference_field
+        .as_mut()
+        .unwrap()
+        .text
+        .as_mut()
+        .unwrap()
+        .text
+        .as_mut()
+        .unwrap()
+        .text = reference.to_string();
+    footprint
+}
+
+/// Mock KiCad holding `footprints`; `FlipItems` is recorded and answered OK,
+/// or with AS_UNHANDLED like stock KiCad when `flip_supported` is false.
+fn spawn_flip_mock(
+    footprints: Vec<kiapi::board::types::FootprintInstance>,
+    flip_supported: bool,
+) -> (MockKicad, CapturedFlip) {
+    let captured: CapturedFlip = Arc::new(Mutex::new(None));
+    let captured_in_mock = captured.clone();
+
+    let mock = spawn_mock(move |req| {
+        let msg = req.message.expect("request must pack a command");
+        if msg.type_url.ends_with("GetOpenDocuments") {
+            let resp = kiapi::common::commands::GetOpenDocumentsResponse {
+                documents: vec![kiapi::common::types::DocumentSpecifier {
+                    r#type: kiapi::common::types::DocumentType::DoctypePcb as i32,
+                    project: None,
+                    identifier: Some(
+                        kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                            "test.kicad_pcb".to_string(),
+                        ),
+                    ),
+                }],
+            };
+            Some(reply_with(builders::pack_any(
+                &resp,
+                "kiapi.common.commands.GetOpenDocumentsResponse",
+            )))
+        } else if msg.type_url.ends_with("GetItems") {
+            let resp = kiapi::common::commands::GetItemsResponse {
+                header: None,
+                status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                items: footprints
+                    .iter()
+                    .map(|footprint| {
+                        builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
+                    })
+                    .collect(),
+            };
+            Some(reply_with(builders::pack_any(
+                &resp,
+                "kiapi.common.commands.GetItemsResponse",
+            )))
+        } else if msg.type_url.ends_with("BeginCommit") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::BeginCommitResponse {
+                    id: Some(kiapi::common::types::Kiid {
+                        value: "flip-commit".to_string(),
+                    }),
+                },
+                "kiapi.common.commands.BeginCommitResponse",
+            )))
+        } else if msg.type_url.ends_with("EndCommit") {
+            Some(reply_with(builders::pack_any(
+                &kiapi::common::commands::EndCommitResponse {},
+                "kiapi.common.commands.EndCommitResponse",
+            )))
+        } else if msg.type_url.ends_with("FlipItems") {
+            *captured_in_mock.lock().unwrap() =
+                Some(kiapi::board::commands::FlipItems::decode(msg.value.as_slice()).unwrap());
+            if flip_supported {
+                Some(ok_response())
+            } else {
+                Some(kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsUnhandled as i32,
+                        error_message: "no handler available for request of type \
+                                        kiapi.board.commands.FlipItems"
+                            .to_string(),
+                    }),
+                    header: None,
+                    message: None,
+                })
+            }
+        } else {
+            Some(ok_response())
+        }
+    });
+
+    (mock, captured)
+}
+
+#[test]
+fn flip_footprints_sends_only_footprints_off_the_target_layer_in_one_request() {
+    let r1 = with_identity(
+        mk_footprint_r1(),
+        "R1",
+        "r1-id",
+        kiapi::board::types::BoardLayer::BlFCu,
+    );
+    let r2 = with_identity(
+        mk_footprint_r1(),
+        "R2",
+        "r2-id",
+        kiapi::board::types::BoardLayer::BlBCu,
+    );
+    let (mock, captured) = spawn_flip_mock(vec![r1, r2], true);
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let outcome = client
+        .flip_footprints(&["R1".to_string(), "R2".to_string()], "B.Cu")
+        .unwrap();
+
+    assert_eq!(outcome.flipped, vec!["R1".to_string()]);
+    assert_eq!(outcome.already_on_layer, vec!["R2".to_string()]);
+    let sent = captured.lock().unwrap().take().expect("FlipItems sent");
+    let ids: Vec<_> = sent.items.iter().map(|id| id.value.as_str()).collect();
+    assert_eq!(ids, vec!["r1-id"]);
+}
+
+#[test]
+fn flip_footprints_sends_nothing_when_every_footprint_is_already_there() {
+    let r1 = with_identity(
+        mk_footprint_r1(),
+        "R1",
+        "r1-id",
+        kiapi::board::types::BoardLayer::BlBCu,
+    );
+    let (mock, captured) = spawn_flip_mock(vec![r1], true);
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let outcome = client.flip_footprints(&["R1".to_string()], "B.Cu").unwrap();
+
+    assert!(outcome.flipped.is_empty());
+    assert_eq!(outcome.already_on_layer, vec!["R1".to_string()]);
+    assert!(
+        captured.lock().unwrap().is_none(),
+        "nothing to flip, nothing sent"
+    );
+}
+
+#[test]
+fn flip_footprints_rejects_a_missing_reference_before_sending() {
+    let r1 = with_identity(
+        mk_footprint_r1(),
+        "R1",
+        "r1-id",
+        kiapi::board::types::BoardLayer::BlFCu,
+    );
+    let (mock, captured) = spawn_flip_mock(vec![r1], true);
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let error = client
+        .flip_footprints(&["R1".to_string(), "R9".to_string()], "B.Cu")
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("R9"), "{error:#}");
+    assert!(captured.lock().unwrap().is_none(), "all or nothing");
+}
+
+#[test]
+fn flip_footprints_explains_a_kicad_without_flip_items() {
+    let r1 = with_identity(
+        mk_footprint_r1(),
+        "R1",
+        "r1-id",
+        kiapi::board::types::BoardLayer::BlFCu,
+    );
+    let (mock, _captured) = spawn_flip_mock(vec![r1], false);
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let error = client
+        .flip_footprints(&["R1".to_string()], "B.Cu")
+        .unwrap_err();
+    let text = format!("{error:#}");
+
+    assert!(text.contains("no FlipItems IPC command"), "{text}");
+    assert!(text.contains("close the board"), "{text}");
+}

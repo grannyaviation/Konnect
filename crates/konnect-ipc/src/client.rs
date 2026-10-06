@@ -2012,6 +2012,84 @@ impl KiCadIpcClient {
             .collect()
     }
 
+    /// Flip footprints to `layer` ("F.Cu" or "B.Cu") with KiCad's own flip,
+    /// through PixelCad's `FlipItems`: each around its own anchor, all in one
+    /// undo step. Footprints already on `layer` are left alone and reported.
+    /// Stock KiCad has no `FlipItems` and answers AS_UNHANDLED, which is
+    /// reported as such so the caller can point at the closed-board flip.
+    pub fn flip_footprints(&self, references: &[String], layer: &str) -> Result<IpcFlipOutcome> {
+        let target = match layer {
+            "F.Cu" => kiapi::board::types::BoardLayer::BlFCu,
+            "B.Cu" => kiapi::board::types::BoardLayer::BlBCu,
+            other => anyhow::bail!("footprints flip to F.Cu or B.Cu, not '{other}'"),
+        } as i32;
+
+        let mut requested = std::collections::HashSet::new();
+        for reference in references {
+            if !requested.insert(reference.as_str()) {
+                anyhow::bail!("flip request names footprint '{reference}' more than once");
+            }
+        }
+
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut outcome = IpcFlipOutcome::default();
+        let mut ids = Vec::new();
+
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+                continue;
+            }
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let reference = footprint_reference(&footprint);
+            if !requested.remove(reference) {
+                continue;
+            }
+            if footprint.layer == target {
+                outcome.already_on_layer.push(reference.to_string());
+            } else {
+                ids.push(
+                    footprint
+                        .id
+                        .clone()
+                        .with_context(|| format!("footprint '{reference}' has no id"))?,
+                );
+                outcome.flipped.push(reference.to_string());
+            }
+        }
+
+        if !requested.is_empty() {
+            let mut missing: Vec<_> = requested.into_iter().collect();
+            missing.sort_unstable();
+            anyhow::bail!(
+                "footprint{} {} not found on board",
+                if missing.len() == 1 { "" } else { "s" },
+                missing.join(", ")
+            );
+        }
+
+        if ids.is_empty() {
+            return Ok(outcome);
+        }
+
+        let board = self.get_board_document()?;
+        self.run_commit("Flip components", |client| {
+            let command = kiapi::board::commands::FlipItems {
+                board: Some(board),
+                items: ids,
+            };
+            match client.send_command(&command, "kiapi.board.commands.FlipItems") {
+                Ok(_) => Ok(()),
+                Err(error) if format!("{error:#}").contains("AS_UNHANDLED") => Err(error.context(
+                    "this KiCad has no FlipItems IPC command (PixelCad adds it); \
+                     close the board in KiCad to flip the file instead",
+                )),
+                Err(error) => Err(error),
+            }
+        })?;
+
+        Ok(outcome)
+    }
+
     /// Update the visible value field of an existing footprint.
     pub fn set_footprint_value(&self, reference: &str, value: &str) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;

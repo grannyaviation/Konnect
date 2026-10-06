@@ -55,6 +55,14 @@ pub struct IpcFootprintPlacement {
     pub rotation: f64,
 }
 
+/// What `flip_footprints` did: the references it flipped and the ones that
+/// were already on the requested side.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct IpcFlipOutcome {
+    pub flipped: Vec<String>,
+    pub already_on_layer: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IpcPadDefinition {
     pub number: String,

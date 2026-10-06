@@ -207,6 +207,18 @@ message RefillZones
   repeated kiapi.common.types.KIID zones = 2;
 }
 
+// Flips footprints to the opposite board side, each around its own anchor, as the F key
+// does for a single footprint.  The flip direction is the board editor's setting (left/right
+// in headless sessions).  All footprints are flipped in one commit; any ID that is not a
+// footprint on this board rejects the whole request and nothing is flipped.
+// Returns Empty.
+message FlipItems
+{
+  kiapi.common.types.DocumentSpecifier board = 1;
+
+  repeated kiapi.common.types.KIID items = 2;
+}
+
 /*
  * Utilities
  */
