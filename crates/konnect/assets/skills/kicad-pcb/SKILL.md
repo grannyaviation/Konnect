@@ -21,8 +21,8 @@ connection communicates with the running KiCAD instance in real-time.
 
 Some board-construction and component tools have guarded closed-board paths. IPC-first
 tools fall back to the file only when the transport is unreachable and the target board
-has not been observed live during this server session. File-only operations such as
-`flip_component` proceed only when KiCad does not hold the target board open. These
+has not been observed live during this server session. `flip_component` flips a
+board KiCad holds open through PixelCad's `FlipItems` IPC command, and otherwise follows the closed-board rule. These
 paths use revision-aware atomic writes: placement preserves pads, graphics, attributes,
 and models; moves preserve the existing angle; rotations update the footprint and its
 child angles; flips mirror supported geometry and swap front/back layers. A reachable
@@ -134,7 +134,7 @@ Do NOT add copper pours before routing is complete — they interfere with inter
 | `update_footprints_from_library` | Refresh placed definitions from linked libraries |
 | `move_component`          | Relocate a footprint via IPC or safe file fallback |
 | `rotate_component`        | Rotate a footprint via IPC or safe file fallback |
-| `flip_component`          | Set F.Cu/B.Cu on a closed board with geometry mirroring |
+| `flip_component`          | Set F.Cu/B.Cu (live via PixelCad FlipItems, or closed board) |
 | `align_components`        | Align multiple components (top/bottom/left/right/center) |
 | `place_component_array`   | Grid placement for repeated elements        |
 

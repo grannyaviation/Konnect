@@ -299,8 +299,9 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
 - For most PCB tools: KiCAD running with the target board open (IPC API).
   `place_component`, `move_component`, and `rotate_component` can safely fall
   back to a closed board file when IPC is unreachable. `flip_component`
-  intentionally requires a closed board because KiCAD IPC has no native
-  footprint-flip command.
+  flips over IPC with PixelCad's `FlipItems` when KiCAD holds the board, and
+  otherwise flips a closed board file; stock KiCAD has no flip command, so
+  there it requires the board closed.
 
 ## License: free for the little guys
 
@@ -341,7 +342,7 @@ unreachable KiCAD produces that message: if KiCAD is running and the tool
 refuses anyway, the error is the tool's own reason for refusing.
 `place_component`, `move_component`, and `rotate_component` can fall back to a
 closed board file when no KiCAD process is reachable; `flip_component`
-requires one, and refuses while KiCAD holds that board open.
+does too, and on a board KiCAD holds open it needs PixelCad's `FlipItems` IPC command.
 
 See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
 that don't appear after `load_toolset`, and transaction recovery.

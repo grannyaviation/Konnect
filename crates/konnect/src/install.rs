@@ -769,7 +769,7 @@ mod tests {
         );
         assert_eq!(
             registered.get("flip_component"),
-            Some(&konnect_core::tools::BoardAccess::ClosedBoardOnly)
+            Some(&konnect_core::tools::BoardAccess::LivePreferredWithFallback)
         );
         assert_eq!(
             registered.get("plan_bga_fanout"),
