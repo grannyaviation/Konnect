@@ -58,15 +58,93 @@ pub enum ToolErrorKind {
         target: String,
         candidates: Vec<String>,
     },
+    /// The requested document is not the document set observed in the target
+    /// editor, so proceeding would answer about or mutate another file.
+    WrongDocument {
+        requested: String,
+        open_documents: Vec<String>,
+    },
+    /// No open document belongs to the explicitly requested project.
+    WrongProject {
+        requested: String,
+        open_projects: Vec<String>,
+    },
+    /// The requested schematic hierarchy instance is not the instance set
+    /// observed in the exact live schematic editor context.
+    WrongSheetInstance {
+        requested: String,
+        open_sheet_instances: Vec<String>,
+    },
     /// The caller named a target, but its observed editor or document state
     /// no longer agrees with the state required to mutate it safely.
     StaleTarget { target: String, reason: String },
+    /// A valid request produced a plan, but applying that plan would be unsafe
+    /// or would not improve the requested result. The same reasons are exposed
+    /// by dry-run planning so callers can revise the request without guessing.
+    PlanBlocked {
+        operation: String,
+        reasons: Vec<String>,
+    },
+    /// No live editor endpoint is configured or reachable for the requested
+    /// semantic operation.
+    EditorUnavailable { editor: String, reason: String },
+    /// The running KiCad version or the bundled stable protocol does not
+    /// provide a capability the caller requested.
+    UnsupportedCapability {
+        capability: String,
+        kicad_version: Option<String>,
+    },
+    /// KiCad accepted a semantic mutation, but a fresh observation did not
+    /// prove the exact requested post-operation state.
+    ReadbackMismatch {
+        operation: String,
+        requested_kiids: Vec<String>,
+        before_kiids: Vec<String>,
+        after_kiids: Vec<String>,
+    },
+    /// A file mutation committed, but its immediate readback did not prove the
+    /// requested result. Callers must inspect or reload the named document
+    /// before retrying because the operation was not a no-op.
+    MutationOutcomeUncertain {
+        operation: String,
+        path: String,
+        reason: String,
+    },
+    /// Saved KiCad structure cannot prove one exact destination for a
+    /// cross-probe source object.
+    UnresolvedCrossProbeDestination {
+        source_kiid: String,
+        candidates: Vec<String>,
+        reason: String,
+    },
     /// A board was live earlier in this server process, but IPC is now gone;
     /// its saved file may be stale relative to lost editor state.
-    UnsafeFileFallback { path: String },
+    UnsafeFileFallback { path: String, reason: String },
+    /// KiCad answered, and its open-document list could not be read as a
+    /// complete set of comparable board identities — so whether it holds this
+    /// board is unknown, and neither a live edit nor a file edit is safe.
+    AmbiguousOpenBoard { path: String },
+    /// A configuration file exists but cannot be used: malformed JSON, a
+    /// non-object root, or an I/O failure other than absence. Defaults are
+    /// never substituted for it, because the next save would persist them
+    /// over the user's own settings (#580). `reason` starts with
+    /// `malformed_json:` or `unreadable:`.
+    InvalidConfiguration { path: String, reason: String },
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
+    /// A delivered IPC request has no confirmed outcome. Retrying may duplicate work.
+    IpcBatchRecovered {
+        board_state: String,
+        drop_confirmed: bool,
+        retry_safe: bool,
+        reason: String,
+    },
+    IpcOutcomeUnknown {
+        board_state: String,
+        retry_safe: bool,
+        reason: String,
+    },
 }
 
 impl ToolErrorKind {
@@ -81,9 +159,22 @@ impl ToolErrorKind {
             Self::FileNotFound { .. } => "file_not_found",
             Self::Conflict { .. } => "conflict",
             Self::AmbiguousTarget { .. } => "ambiguous_target",
+            Self::WrongDocument { .. } => "wrong_document",
+            Self::WrongProject { .. } => "wrong_project",
+            Self::WrongSheetInstance { .. } => "wrong_sheet_instance",
             Self::StaleTarget { .. } => "stale_target",
+            Self::PlanBlocked { .. } => "plan_blocked",
+            Self::EditorUnavailable { .. } => "editor_unavailable",
+            Self::UnsupportedCapability { .. } => "unsupported_capability",
+            Self::ReadbackMismatch { .. } => "readback_mismatch",
+            Self::MutationOutcomeUncertain { .. } => "mutation_outcome_uncertain",
+            Self::UnresolvedCrossProbeDestination { .. } => "unresolved_cross_probe_destination",
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
+            Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
+            Self::InvalidConfiguration { .. } => "invalid_configuration",
             Self::HandlerError { .. } => "handler_error",
+            Self::IpcOutcomeUnknown { .. } => "ipc_outcome_unknown",
+            Self::IpcBatchRecovered { .. } => "ipc_batch_recovered",
         }
     }
 }
@@ -210,11 +301,55 @@ mod tests {
                 target: "t".into(),
                 candidates: vec!["a".into(), "b".into()],
             },
+            ToolErrorKind::WrongDocument {
+                requested: "p".into(),
+                open_documents: vec!["a".into()],
+            },
+            ToolErrorKind::WrongProject {
+                requested: "p".into(),
+                open_projects: vec!["a".into()],
+            },
+            ToolErrorKind::WrongSheetInstance {
+                requested: "/root/child".into(),
+                open_sheet_instances: vec!["/root/other".into()],
+            },
             ToolErrorKind::StaleTarget {
                 target: "p".into(),
                 reason: "r".into(),
             },
-            ToolErrorKind::UnsafeFileFallback { path: "p".into() },
+            ToolErrorKind::PlanBlocked {
+                operation: "place".into(),
+                reasons: vec!["outside board".into()],
+            },
+            ToolErrorKind::EditorUnavailable {
+                editor: "pcb".into(),
+                reason: "closed".into(),
+            },
+            ToolErrorKind::UnsupportedCapability {
+                capability: "activate_sheet".into(),
+                kicad_version: Some("10.0.5".into()),
+            },
+            ToolErrorKind::ReadbackMismatch {
+                operation: "add".into(),
+                requested_kiids: vec!["b".into()],
+                before_kiids: vec!["a".into()],
+                after_kiids: vec!["a".into()],
+            },
+            ToolErrorKind::MutationOutcomeUncertain {
+                operation: "edit".into(),
+                path: "p".into(),
+                reason: "r".into(),
+            },
+            ToolErrorKind::UnresolvedCrossProbeDestination {
+                source_kiid: "sym".into(),
+                candidates: vec!["fp-a".into(), "fp-b".into()],
+                reason: "ambiguous".into(),
+            },
+            ToolErrorKind::UnsafeFileFallback {
+                path: "p".into(),
+                reason: "r".into(),
+            },
+            ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
         ];
         for kind in kinds {

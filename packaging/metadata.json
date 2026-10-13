@@ -1,8 +1,8 @@
 {
   "$schema": "https://go.kicad.org/pcm/schemas/v1",
   "name": "Konnect",
-  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 225 tools organized into on-demand toolsets.",
-  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 20 toolsets loaded on demand so the AI only sees relevant tools at once.",
+  "description": "AI-assisted PCB design via the Model Context Protocol. Enables Claude and other AI assistants to design schematics and PCBs with 232 tools organized into on-demand toolsets.",
+  "description_full": "Konnect exposes a complete set of KiCAD design tools to AI assistants via the Model Context Protocol (MCP). It supports schematic editing, PCB layout, local Freerouting MCP routing, library management, JLCPCB part search, ERC/DRC, design review audits, and full export pipelines. Tools are organized into 21 toolsets loaded on demand so the AI only sees relevant tools at once.",
   "identifier": "com.github.mixelpixx.konnect",
   "type": "plugin",
   "author": {
@@ -17,43 +17,10 @@
   },
   "versions": [
     {
-      "version": "0.11.0",
+      "version": "0.13.0",
       "status": "stable",
       "kicad_version": "10.0",
-      "kicad_version_max": "10.99",
-      "platforms": [
-        "linux"
-      ],
-      "download_sha256": "6b8ea53a2cb2d60f7f3a5b5b618c1c331d24e3ca841ac7bed466d53708fe103f",
-      "download_size": 14354225,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.11.0/konnect-pcm-v0.11.0-linux.zip",
-      "install_size": 41433953
-    },
-    {
-      "version": "0.11.0",
-      "status": "stable",
-      "kicad_version": "10.0",
-      "kicad_version_max": "10.99",
-      "platforms": [
-        "macos"
-      ],
-      "download_sha256": "11a5934a2b6e595b8ead53ac37f60e41393f808e9a168546dc5344755dd7a0b8",
-      "download_size": 27342500,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.11.0/konnect-pcm-v0.11.0-macos.zip",
-      "install_size": 72086969
-    },
-    {
-      "version": "0.11.0",
-      "status": "stable",
-      "kicad_version": "10.0",
-      "kicad_version_max": "10.99",
-      "platforms": [
-        "windows"
-      ],
-      "download_sha256": "81217a0c1d3bfd2f24f46c5ed82843921221fa424e4fae18132dcb17a9f63e8b",
-      "download_size": 13111138,
-      "download_url": "https://github.com/mixelpixx/Konnect/releases/download/v0.11.0/konnect-pcm-v0.11.0-windows.zip",
-      "install_size": 36553599
+      "kicad_version_max": "10.99"
     }
   ]
 }

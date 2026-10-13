@@ -1,6 +1,7 @@
 mod config;
 mod install;
 mod manifest;
+mod run_registry;
 mod transaction_cli;
 mod transport;
 
@@ -163,6 +164,14 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Record this server, and reap the records of servers that are gone
+    // (#103). This is the only spot that sees all three spawn paths — the
+    // Python ActionPlugin, KiCad 10's `exec` entrypoint, and an external MCP
+    // client — so it is the only spot where the bookkeeping cannot be skipped
+    // by launching a different way. The guard has to outlive every transport
+    // below: it holds the lock that proves this process is still alive.
+    let _run_record = run_registry::sweep_and_register(&config.transport);
+
     let server_config = konnect_core::tools::ServerConfig {
         kicad_cli: config.kicad_cli.clone(),
         kicad_binary: config.kicad_binary.clone(),
@@ -173,10 +182,25 @@ async fn main() -> Result<()> {
         eager_toolsets: config.eager_toolsets,
     };
     let handler = McpHandler::new_with_config_resolution(server_config, config_resolution).await?;
+    match install::InstalledGuidanceProbe::for_current_user() {
+        Ok(probe) => handler.set_guidance_probe(std::sync::Arc::new(probe)),
+        Err(error) => tracing::warn!("guidance drift detection unavailable: {error:#}"),
+    }
 
     match config.transport {
         TransportMode::Stdio => {
-            transport::stdio::run_stdio(handler).await?;
+            handler.enable_stdio_reload();
+            match transport::stdio::run_stdio(handler).await? {
+                transport::stdio::StdioExit::Eof => {}
+                #[cfg(unix)]
+                transport::stdio::StdioExit::Reload(plan) => {
+                    // exec does not run destructors. Release the old process's
+                    // run-registry pair explicitly so the replacement can
+                    // register the same PID without leaving stale state.
+                    drop(_run_record);
+                    exec_reload(plan)?;
+                }
+            }
         }
         TransportMode::Http => {
             transport::http::run_http(handler, &config.http_address).await?;
@@ -202,6 +226,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Replace the standalone process through the platform-specific validated
+/// handoff selected by the handler. Keeping this in the binary entry point
+/// makes the embedded library structurally incapable of invoking it.
+#[cfg(unix)]
+fn exec_reload(plan: konnect_core::router::meta_tools::ReloadPlan) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = plan
+        .validated_exec_path()
+        .map_err(|reason| anyhow::anyhow!("reload_server refused final handoff: {reason}"))?;
+    let error = std::process::Command::new(executable)
+        .args(&plan.arguments)
+        .exec();
+    Err(anyhow::anyhow!(
+        "reload_server failed to exec {}: {error}",
+        plan.binary_path.display()
+    ))
 }
 
 /// Help for one subcommand, or the whole program.

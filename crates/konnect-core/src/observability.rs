@@ -34,6 +34,10 @@ pub const MAX_RECENT_CALLS: usize = 100;
 pub enum CallStatus {
     /// Tool ran to completion and reported success.
     Ok,
+    /// Some requested items or checks completed and others did not.
+    Partial,
+    /// Persistence may have happened, but readback could not establish it.
+    Uncertain,
     /// Tool ran to completion but reported `is_error: true`, or the handler
     /// returned an `anyhow::Error`.
     Error,
@@ -45,6 +49,8 @@ impl CallStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             CallStatus::Ok => "ok",
+            CallStatus::Partial => "partial",
+            CallStatus::Uncertain => "uncertain",
             CallStatus::Error => "error",
             CallStatus::NotFound => "not_found",
         }
@@ -79,6 +85,8 @@ pub struct CallRecord {
 pub struct ToolStats {
     pub total: u64,
     pub errors: u64,
+    pub partial: u64,
+    pub uncertain: u64,
     pub total_duration_ms: u64,
     /// Last call's status for quick "is it healthy right now?" checks.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,6 +108,8 @@ struct Inner {
     per_tool: Mutex<HashMap<String, ToolStats>>,
     total_calls: AtomicU64,
     error_calls: AtomicU64,
+    partial_calls: AtomicU64,
+    uncertain_calls: AtomicU64,
     started_at_ms: u64,
     started_instant: Instant,
     log_path: Option<PathBuf>,
@@ -132,6 +142,8 @@ impl CallObserver {
                 per_tool: Mutex::new(HashMap::new()),
                 total_calls: AtomicU64::new(0),
                 error_calls: AtomicU64::new(0),
+                partial_calls: AtomicU64::new(0),
+                uncertain_calls: AtomicU64::new(0),
                 started_at_ms: now_ms,
                 started_instant: Instant::now(),
                 log_path: resolved_log_path,
@@ -144,8 +156,14 @@ impl CallObserver {
     pub async fn record(&self, rec: CallRecord) {
         // Update counters.
         self.inner.total_calls.fetch_add(1, Ordering::Relaxed);
-        if matches!(rec.status, CallStatus::Error) {
+        if matches!(rec.status, CallStatus::Error | CallStatus::Uncertain) {
             self.inner.error_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(rec.status, CallStatus::Partial) {
+            self.inner.partial_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(rec.status, CallStatus::Uncertain) {
+            self.inner.uncertain_calls.fetch_add(1, Ordering::Relaxed);
         }
 
         // Update per-tool stats.
@@ -155,9 +173,15 @@ impl CallObserver {
             entry.total += 1;
             entry.total_duration_ms += rec.dur_ms;
             entry.last_status = Some(rec.status.as_str().to_string());
-            if matches!(rec.status, CallStatus::Error) {
+            if matches!(rec.status, CallStatus::Error | CallStatus::Uncertain) {
                 entry.errors += 1;
                 entry.last_error = rec.error_kind.clone();
+            }
+            if matches!(rec.status, CallStatus::Partial) {
+                entry.partial += 1;
+            }
+            if matches!(rec.status, CallStatus::Uncertain) {
+                entry.uncertain += 1;
             }
         }
 
@@ -213,6 +237,8 @@ impl CallObserver {
             uptime_ms,
             total_calls: self.inner.total_calls.load(Ordering::Relaxed),
             error_calls: self.inner.error_calls.load(Ordering::Relaxed),
+            partial_calls: self.inner.partial_calls.load(Ordering::Relaxed),
+            uncertain_calls: self.inner.uncertain_calls.load(Ordering::Relaxed),
             log_path: self
                 .inner
                 .log_path
@@ -229,6 +255,8 @@ pub struct StatsSnapshot {
     pub uptime_ms: u64,
     pub total_calls: u64,
     pub error_calls: u64,
+    pub partial_calls: u64,
+    pub uncertain_calls: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
     pub per_tool: HashMap<String, ToolStats>,
@@ -300,7 +328,7 @@ mod tests {
             toolset: Some("test".to_string()),
             dur_ms: 5,
             status,
-            error_kind: if matches!(status, CallStatus::Error) {
+            error_kind: if matches!(status, CallStatus::Error | CallStatus::Uncertain) {
                 Some("boom".to_string())
             } else {
                 None
@@ -342,6 +370,28 @@ mod tests {
 
         let rt = snap.per_tool.get("route_trace").unwrap();
         assert_eq!(rt.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn partial_and_uncertain_calls_are_accounted_separately() {
+        let obs = CallObserver::new(None);
+        obs.record(sample_record("batch_place_components", CallStatus::Partial))
+            .await;
+        obs.record(sample_record(
+            "batch_place_components",
+            CallStatus::Uncertain,
+        ))
+        .await;
+
+        let snap = obs.snapshot().await;
+        assert_eq!(snap.total_calls, 2);
+        assert_eq!(snap.partial_calls, 1);
+        assert_eq!(snap.uncertain_calls, 1);
+        assert_eq!(snap.error_calls, 1, "uncertain is still error-like");
+        let stats = snap.per_tool.get("batch_place_components").unwrap();
+        assert_eq!(stats.partial, 1);
+        assert_eq!(stats.uncertain, 1);
+        assert_eq!(stats.last_status.as_deref(), Some("uncertain"));
     }
 
     #[tokio::test]

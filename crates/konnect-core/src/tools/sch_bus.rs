@@ -317,10 +317,9 @@ async fn handle_add_bus_entry(
     // instead (#329). Judge both corners against the sheet's actual bus
     // segments and only fall back to the convention when geometry cannot
     // decide.
-    let round6 = |value: f64| (value * 1e6).round() / 1e6;
     let far = (
-        round6(x + direction.size().0),
-        round6(y + direction.size().1),
+        konnect_sexp::geometry::round6(x + direction.size().0),
+        konnect_sexp::geometry::round6(y + direction.size().1),
     );
     let (at_on_bus, far_on_bus) = match parse_sexp(&content) {
         Ok(tree) => {
@@ -526,7 +525,11 @@ async fn handle_add_bus_alias(
     let content = std::fs::read_to_string(&sch_path)?;
     // Match the file's own indentation, or a targeted edit comes back as a
     // whole-file reindent the next time eeschema saves.
-    let indent = if content.contains("\n\t(") { "\t" } else { "  " };
+    let indent = if content.contains("\n\t(") {
+        "\t"
+    } else {
+        "  "
+    };
     let block = format_bus_alias(&name, &members, indent);
 
     let (new_content, action, previous) = match find_alias_span(&content, &name) {
@@ -829,7 +832,12 @@ fn close_of_node(content: &str, start: usize) -> Option<usize> {
 /// where eeschema puts them, so its next save produces no diff of its own.
 /// Falls back to after the sheet `(uuid ...)`.
 fn alias_insert_offset(content: &str) -> Option<usize> {
-    for opener in ["\n\t(lib_symbols", "\n  (lib_symbols", "\n\t(uuid ", "\n  (uuid "] {
+    for opener in [
+        "\n\t(lib_symbols",
+        "\n  (lib_symbols",
+        "\n\t(uuid ",
+        "\n  (uuid ",
+    ] {
         let Some(found) = content.find(opener) else {
             continue;
         };
@@ -891,7 +899,12 @@ fn hierarchy_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn walk_hierarchy(path: &Path, depth: usize, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+fn walk_hierarchy(
+    path: &Path,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if depth > crate::tools::sch_hierarchy::MAX_HIERARCHY_DEPTH || !visited.insert(canon) {
         return;
@@ -1135,7 +1148,13 @@ mod tests {
     /// references to aliases nothing defines.
     #[test]
     fn text_markup_is_not_a_group_bus() {
-        for markup in ["~{RESET}", "~{CS_ACCEL}", "~{GPS_SAFEBOOT}", "_{sub}", "^{sup}"] {
+        for markup in [
+            "~{RESET}",
+            "~{CS_ACCEL}",
+            "~{GPS_SAFEBOOT}",
+            "_{sub}",
+            "^{sup}",
+        ] {
             assert_eq!(split_group_bus(markup), None, "{markup} is markup");
             assert_eq!(alias_reference(markup), None, "{markup} names no alias");
         }
@@ -1202,18 +1221,29 @@ mod tests {
     #[tokio::test]
     async fn alias_is_written_after_lib_symbols() {
         let (_dir, path) = sheet_with_lib_symbols();
-        let response = call_json!(handle_add_bus_alias, json!({ "schematic": path, "name": "DSI", "members": ["D0_P", "D0_N", "C_P", "C_N"] }));
+        let response = call_json!(
+            handle_add_bus_alias,
+            json!({ "schematic": path, "name": "DSI", "members": ["D0_P", "D0_N", "C_P", "C_N"] })
+        );
         assert_eq!(response["action"], "added", "{response}");
         assert_eq!(response["reference_form"], "PREFIX{DSI}");
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains("(bus_alias \"DSI\"\n\t\t(members \"D0_P\" \"D0_N\" \"C_P\" \"C_N\")\n\t)"),
+            text.contains(
+                "(bus_alias \"DSI\"\n\t\t(members \"D0_P\" \"D0_N\" \"C_P\" \"C_N\")\n\t)"
+            ),
             "{text}"
         );
         let alias_at = text.find("(bus_alias").unwrap();
-        assert!(alias_at > text.find("(lib_symbols").unwrap(), "before lib_symbols");
-        assert!(alias_at < text.find("(junction").unwrap(), "after the drawing starts");
+        assert!(
+            alias_at > text.find("(lib_symbols").unwrap(),
+            "before lib_symbols"
+        );
+        assert!(
+            alias_at < text.find("(junction").unwrap(),
+            "after the drawing starts"
+        );
     }
 
     /// Redefining replaces. Two blocks for one alias is a file KiCad resolves

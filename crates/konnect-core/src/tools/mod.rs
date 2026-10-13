@@ -1,24 +1,42 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+#[cfg(test)]
+mod board_extents_tests;
 mod board_session;
+mod board_source;
+#[cfg(test)]
+mod board_source_contract_tests;
+mod board_stackup;
 pub mod cli;
 pub mod config;
+pub(crate) mod cross_probe;
 pub mod design_review;
+pub(crate) mod drc;
+pub mod editor_navigation;
 mod footprint_graphics;
 mod footprint_metadata;
 mod footprint_models;
 pub mod integration;
+mod jlcpcb_midpoints;
+mod lcsc_packages;
 pub mod library;
+mod library_footprint;
+pub(crate) mod live_board;
 pub mod manufacturing;
+pub(crate) mod navigation_target;
 pub mod pcb_board;
 pub mod pcb_components;
 pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
+mod placed_footprint_models;
 pub mod placement;
 pub mod project;
+#[cfg(test)]
+mod project_file_writer_tests;
 pub mod sch_analysis;
+pub(crate) mod sch_annotate;
 pub mod sch_batch;
 pub mod sch_bus;
 pub mod sch_components;
@@ -59,6 +77,9 @@ pub struct ToolDef {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    /// Compiled once with the tool definition and reused for every dispatch.
+    /// The schema shown to clients is therefore the schema the server enforces.
+    pub input_validator: Arc<jsonschema::Validator>,
     pub handler: ToolHandlerFn,
     /// How the tool interacts with a board held by KiCad. Client guidance can
     /// derive warnings from this runtime contract instead of maintaining a
@@ -86,6 +107,24 @@ pub enum BoardAccess {
 }
 
 impl ToolDef {
+    pub fn new(
+        name: &'static str,
+        description: &'static str,
+        mut input_schema: Value,
+        handler: ToolHandlerFn,
+    ) -> Self {
+        close_input_schema(&mut input_schema);
+        let input_validator = compile_input_validator(name, &input_schema);
+        Self {
+            name,
+            description,
+            input_schema,
+            input_validator,
+            handler,
+            board_access: BoardAccess::None,
+        }
+    }
+
     pub fn with_board_access(mut self, board_access: BoardAccess) -> Self {
         self.board_access = board_access;
         self
@@ -100,7 +139,105 @@ impl ToolDef {
     }
 }
 
+/// Fixed tool argument records are closed by default. Caller-keyed maps opt in
+/// with explicit `additionalProperties: true` or a value schema. Visit schema
+/// keywords only: examples, defaults and arbitrary caller data are not schemas.
+/// Run before advertising AND compiling so clients see the enforced contract.
+pub(crate) fn close_input_schema(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if object.get("type").is_some_and(|value| {
+        value == "object"
+            || value
+                .as_array()
+                .is_some_and(|types| types.iter().any(|t| t == "object"))
+    }) || object.contains_key("properties")
+        || object.contains_key("patternProperties")
+    {
+        object
+            .entry("additionalProperties")
+            .or_insert(Value::Bool(false));
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                close_input_schema(child);
+            }
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_array_mut) {
+            for child in children {
+                close_input_schema(child);
+            }
+        }
+    }
+    for keyword in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = object.get_mut(keyword) {
+            close_input_schema(child);
+        }
+    }
+}
+
 // Implement Debug manually because handler is not Debug
+#[cfg(test)]
+mod input_record_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schema_policy_preserves_defaults_examples_and_explicit_maps() {
+        let data = json!({"type": "object", "properties": {"user": "data"}});
+        let mut schema = json!({
+            "type": "object", "default": data, "examples": [data],
+            "properties": {
+                "value": {},
+                "map": {"type": "object", "additionalProperties": true},
+                "typed_map": {"type": "object", "additionalProperties": {
+                    "type": "object", "properties": {"x": {"type": "number"}}
+                }},
+                "records": {"type": "array", "items": {"oneOf": [{
+                    "type": "object", "properties": {"x": {"type": "number"}}
+                }]}}
+            }
+        });
+        close_input_schema(&mut schema);
+        assert_eq!(schema["default"], data);
+        assert_eq!(schema["examples"], json!([data]));
+        assert_eq!(schema["properties"]["value"], json!({}));
+        assert_eq!(schema["properties"]["map"]["additionalProperties"], true);
+        assert_eq!(
+            schema["properties"]["typed_map"]["additionalProperties"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["records"]["items"]["oneOf"][0]["additionalProperties"],
+            false
+        );
+        let sealed = schema.clone();
+        close_input_schema(&mut schema);
+        assert_eq!(schema, sealed, "catalogue reconstruction is idempotent");
+    }
+}
+
 impl std::fmt::Debug for ToolDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolDef")
@@ -129,6 +266,9 @@ pub struct ToolContext {
     /// `unavailable` so a caller that does not track the load reports absence
     /// rather than a fabricated `defaults`.
     pub config_resolution: crate::config_resolution::ConfigResolution,
+    /// Reads installed guidance for drift. Set once by the standalone binary,
+    /// which owns the bundle; absent in embedded and test contexts (#728).
+    pub(crate) guidance: std::sync::OnceLock<std::sync::Arc<dyn crate::guidance::GuidanceProbe>>,
 }
 
 impl ToolContext {
@@ -136,12 +276,13 @@ impl ToolContext {
     /// tests and by callers that don't need persistent call logs.
     pub fn new(config: ServerConfig, router: Arc<ToolRouter>) -> Self {
         ToolContext {
-            config,
+            config: config.normalized(),
             router,
             observer: crate::observability::CallObserver::new(None),
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
+            guidance: std::sync::OnceLock::new(),
         }
     }
 
@@ -153,12 +294,13 @@ impl ToolContext {
         observer: crate::observability::CallObserver,
     ) -> Self {
         ToolContext {
-            config,
+            config: config.normalized(),
             router,
             observer,
             jlcpcb_cache: QueryCache::default(),
             board_session: board_session::BoardSessionMemory::default(),
             config_resolution: crate::config_resolution::ConfigResolution::unavailable(),
+            guidance: std::sync::OnceLock::new(),
         }
     }
 
@@ -239,11 +381,80 @@ pub struct ServerConfig {
     pub eager_toolsets: bool,
 }
 
+impl ServerConfig {
+    /// A blank database setting means "use the platform default", including
+    /// settings saved by the plugin. Preserve nonblank paths byte-for-byte.
+    fn normalized(mut self) -> Self {
+        if self
+            .jlcpcb_db_path
+            .as_ref()
+            .is_some_and(|path| path.to_str().is_some_and(|value| value.trim().is_empty()))
+        {
+            self.jlcpcb_db_path = None;
+        }
+        self
+    }
+}
+
 /// Serialises tests that set `KICAD*_DIR`. Those are process-wide and read at
 /// call time by `find_kicad_library_dirs`, so two such tests running
 /// concurrently see each other's directories.
 #[cfg(test)]
 pub(crate) static KICAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A project directory whose `sym-lib-table` resolves `Device:R` and
+/// `power:PWR_FLAG` to their stock KiCad 10 definitions. Put the test's
+/// schematic in the returned directory.
+#[cfg(test)]
+pub(crate) fn stock_reference_prefix_libraries(
+) -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+    let guard = KICAD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/reference_prefix_kicad10");
+    let dir = tempfile::tempdir().unwrap();
+    // Escaped, as KiCad writes it: raw, the Windows `…\tests\…` reads `\t` as a TAB.
+    let lib = |name: &str| {
+        let uri = fixtures.join(format!("{name}.kicad_sym"));
+        format!(
+            "  (lib (name \"{name}\") (type \"KiCad\") (uri {}) (options \"\") (descr \"\"))\n",
+            library::quote_lib_table_string(&uri.display().to_string())
+        )
+    };
+    std::fs::write(
+        dir.path().join("sym-lib-table"),
+        format!(
+            "(sym_lib_table\n  (version 7)\n{}{})\n",
+            lib("Device"),
+            lib("power")
+        ),
+    )
+    .unwrap();
+    std::env::set_var("KICAD10_SYMBOL_DIR", dir.path());
+    (dir, guard)
+}
+
+/// `(lib_id, reference, instance references)` of every symbol, sorted.
+#[cfg(test)]
+pub(crate) fn placed_references(path: &std::path::Path) -> Vec<(String, String, Vec<String>)> {
+    let sch = konnect_schematic_editor::Schematic::load(path).unwrap();
+    let mut refs: Vec<_> = sch
+        .symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.lib_id.clone(),
+                symbol.reference().unwrap_or_default().to_string(),
+                symbol
+                    .instances()
+                    .into_iter()
+                    .filter_map(|instance| instance.reference)
+                    .collect(),
+            )
+        })
+        .collect();
+    refs.sort();
+    refs
+}
 
 #[cfg(test)]
 mod query_cache_tests {
@@ -305,14 +516,18 @@ macro_rules! tool {
             let ctx = ctx.clone();
             Box::pin(async move { ($handler)(&args, &*ctx).await })
         });
-        $crate::tools::ToolDef {
-            name: $name,
-            description: $desc,
-            input_schema: $schema,
-            handler: h,
-            board_access: $crate::tools::BoardAccess::None,
-        }
+        $crate::tools::ToolDef::new($name, $desc, $schema, h)
     }};
+}
+
+pub(crate) fn compile_input_validator(
+    name: &str,
+    input_schema: &Value,
+) -> Arc<jsonschema::Validator> {
+    Arc::new(
+        jsonschema::draft202012::new(input_schema)
+            .unwrap_or_else(|error| panic!("invalid input schema for tool '{name}': {error}")),
+    )
 }
 
 // ─── IPC helpers ──────────────────────────────────────────────────────────────
@@ -346,10 +561,38 @@ where
     }
 }
 
+/// Unknown is not a rejection or evidence of no mutation. Never advise a blind retry.
+pub(crate) fn ipc_recovered_result(message: &str) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::IpcBatchRecovered {
+            board_state: "unchanged".into(), drop_confirmed: true,
+            retry_safe: false, reason: message.into(),
+        },
+        format!("{message}. The apply was aborted, not published. Run a fresh dry run before deciding whether to apply again; no automatic retry or file fallback was attempted."),
+    )
+}
+
+pub(crate) fn ipc_uncertain_result(message: &str) -> CallToolResult {
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::IpcOutcomeUnknown {
+            board_state: "unknown".to_string(),
+            retry_safe: false,
+            reason: message.to_string(),
+        },
+        format!("{message}. Do not repeat the mutation or edit the saved file. Inspect the requested live board and reconcile any applied work before retrying. Automatic recovery has not been established."),
+    )
+}
+
 /// Run a board-targeted IPC call and remember the requested board as soon as
 /// KiCad positively identifies it. Observation happens before `f`, so a later
 /// command rejection, timeout, or editor crash cannot make the next file
 /// fallback treat this board as never having been live.
+///
+/// `f` receives the document KiCad resolved, exactly as
+/// [`with_bound_board_ipc_classified`] hands it over — asking for it again
+/// costs a second `GetOpenDocuments` (#676). The difference between the two
+/// helpers is only what an endpoint that served no board becomes: here it is
+/// flattened into a rejection, for the callers that had no name for it.
 pub(crate) async fn with_board_ipc_classified<T, F>(
     ctx: &ToolContext,
     board_path: &std::path::Path,
@@ -357,15 +600,144 @@ pub(crate) async fn with_board_ipc_classified<T, F>(
 ) -> anyhow::Result<Result<T, konnect_ipc::IpcFailure>>
 where
     T: Send + 'static,
-    F: FnOnce(&konnect_ipc::client::KiCadIpcClient) -> anyhow::Result<T> + Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
+{
+    Ok(
+        match with_bound_board_ipc_classified(ctx, board_path, f).await? {
+            Ok(BoardBinding::Bound(value)) => Ok(value),
+            // Preserved, not decided. Every caller of this helper saw an
+            // endpoint that served no board as a plain rejection before those
+            // cases were given names, and this does not change what any of
+            // them do with it.
+            Ok(BoardBinding::Unserved { message, .. }) => {
+                Err(konnect_ipc::IpcFailure::Rejected(message))
+            }
+            Err(failure) => Err(failure),
+        },
+    )
+}
+
+/// Whether a board-targeted call reached the board at all.
+pub(crate) enum BoardBinding<T> {
+    /// KiCad named one document for the requested board, and `f` ran.
+    Bound(T),
+    /// KiCad answered without ever naming a board document, so nothing was
+    /// identified and `f` never ran. `absence` says which of the two answers
+    /// that was, because they support different statements about KiCad.
+    Unserved {
+        absence: BoardEditorAbsence,
+        message: String,
+    },
+}
+
+/// Why KiCad answered a board-targeted call without naming a board.
+///
+/// Both leave Konnect with no live board, and both are answers rather than
+/// transport failures — but only one of them says anything about KiCad's
+/// editors, and the disclosure a caller reads must not claim more than the
+/// status code carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoardEditorAbsence {
+    /// `AS_UNHANDLED`: no handler for board documents is registered at this
+    /// endpoint. This is what the project manager looks like with no PCB
+    /// editor open — a state with no editor whose unsaved work could be at
+    /// stake.
+    NoPcbEditor,
+    /// `AS_UNIMPLEMENTED`: this build does not implement the command that
+    /// names open documents. Whether a PCB editor is behind the endpoint was
+    /// never established, so nothing may be claimed about one.
+    OpenDocumentsUnimplemented,
+}
+
+impl BoardEditorAbsence {
+    /// The machine-readable reason code a saved-file answer discloses. Part of
+    /// the closed `source_evidence.reason` vocabulary a client matches on.
+    pub(crate) fn reason_code(self) -> &'static str {
+        match self {
+            Self::NoPcbEditor => "no_pcb_editor_at_endpoint",
+            Self::OpenDocumentsUnimplemented => "open_documents_unimplemented_at_endpoint",
+        }
+    }
+
+    /// What KiCad actually said, in prose, as the clause following "KiCad is
+    /// running but …". It states only what the status code carries: an
+    /// unimplemented command is not evidence that no editor is open.
+    pub(crate) fn observed(self) -> &'static str {
+        match self {
+            Self::NoPcbEditor => "reports no PCB editor at this endpoint",
+            Self::OpenDocumentsUnimplemented => {
+                "does not implement the command that names its open documents, so whether a PCB \
+                 editor holds this board was never established"
+            }
+        }
+    }
+
+    /// Classify the status KiCad answered with, or `None` when the refusal
+    /// says nothing about whether documents can be named here.
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        let status = konnect_ipc::ApiStatusError::from_error(error)?;
+        let code =
+            |code: konnect_ipc::gen::kiapi::common::ApiStatusCode| status.code == code as i32;
+        if code(konnect_ipc::gen::kiapi::common::ApiStatusCode::AsUnhandled) {
+            Some(Self::NoPcbEditor)
+        } else if code(konnect_ipc::gen::kiapi::common::ApiStatusCode::AsUnimplemented) {
+            Some(Self::OpenDocumentsUnimplemented)
+        } else {
+            None
+        }
+    }
+}
+
+/// As [`with_board_ipc_classified`], handing `f` the document KiCad resolved
+/// rather than leaving it to ask again.
+///
+/// Targeting is the whole point of this helper, and a closure that re-derives
+/// its own document pays a second `GetOpenDocuments` for the privilege. So
+/// does a `KiCadIpcClient` method with no document argument: it asks again,
+/// then reselects the bound board or fails with `StaleDocument` if that board
+/// has since closed.
+pub(crate) async fn with_bound_board_ipc_classified<T, F>(
+    ctx: &ToolContext,
+    board_path: &std::path::Path,
+    f: F,
+) -> anyhow::Result<Result<BoardBinding<T>, konnect_ipc::IpcFailure>>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &konnect_ipc::client::KiCadIpcClient,
+            konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+        ) -> anyhow::Result<T>
+        + Send
+        + 'static,
 {
     let requested = board_path.to_path_buf();
     let observation = requested.clone();
     let memory = ctx.board_session.clone();
     with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
-        client.ensure_board_is_active(&requested)?;
+        let document = match client.find_open_board(&requested) {
+            Ok(document) => document,
+            // Classified by the typed status in the chain, never by message
+            // text. It has to happen here: `IpcFailure` keeps only the
+            // rendered message, so by the time the caller sees one the status
+            // is gone — and the two unsupported statuses part company here,
+            // because only one of them is evidence about KiCad's editors.
+            Err(error) => match BoardEditorAbsence::from_error(&error) {
+                Some(absence) => {
+                    return Ok(BoardBinding::Unserved {
+                        absence,
+                        message: format!("{error:#}"),
+                    })
+                }
+                None => return Err(error),
+            },
+        };
         memory.observe_live(&observation);
-        f(client)
+        f(client, document).map(BoardBinding::Bound)
     })
     .await
 }
@@ -415,6 +787,120 @@ fn warn_if_ipc_unreachable(address: &str, error: &anyhow::Error) {
     );
 }
 
+/// Convert an IPC board-target refusal into the stable MCP error taxonomy.
+pub(crate) fn ipc_target_error_result(error: &konnect_ipc::BoardTargetError) -> CallToolResult {
+    use konnect_ipc::BoardTargetError;
+
+    let message = format!("{}. Konnect did not read or modify another board.", error);
+    match error {
+        BoardTargetError::NoOpenDocuments { requested } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: Vec::new(),
+            },
+            message,
+        ),
+        BoardTargetError::WrongDocument {
+            requested,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::WrongDocument {
+                requested: requested.clone(),
+                open_documents: open_documents.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::AmbiguousDocument {
+            requested,
+            candidates,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::AmbiguousTarget {
+                target: requested.clone(),
+                candidates: candidates.clone(),
+            },
+            message,
+        ),
+        BoardTargetError::UnresolvedDocumentIdentities { requested, .. } => {
+            CallToolResult::error_kind(
+                crate::mcp::error::ToolErrorKind::AmbiguousOpenBoard {
+                    path: requested.clone(),
+                },
+                message,
+            )
+        }
+        BoardTargetError::StaleDocument {
+            requested,
+            previously_bound,
+            open_documents,
+        } => CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: requested.clone(),
+                reason: format!(
+                    "previously bound document '{}' is no longer uniquely open; observed [{}]",
+                    previously_bound,
+                    open_documents.join(", ")
+                ),
+            },
+            message,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod ipc_target_error_tests {
+    use super::*;
+
+    #[test]
+    fn ipc_document_target_failures_keep_distinct_structured_kinds() {
+        let cases = [
+            (
+                konnect_ipc::BoardTargetError::NoOpenDocuments {
+                    requested: "target.kicad_pcb".to_string(),
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::WrongDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "wrong_document",
+            ),
+            (
+                konnect_ipc::BoardTargetError::AmbiguousDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    candidates: vec!["target.kicad_pcb".to_string(); 2],
+                },
+                "ambiguous_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::StaleDocument {
+                    requested: "target.kicad_pcb".to_string(),
+                    previously_bound: "target.kicad_pcb".to_string(),
+                    open_documents: vec!["other.kicad_pcb".to_string()],
+                },
+                "stale_target",
+            ),
+            (
+                konnect_ipc::BoardTargetError::UnresolvedDocumentIdentities {
+                    requested: "target.kicad_pcb".to_string(),
+                    reasons: vec!["unidentified document".to_string()],
+                },
+                "ambiguous_open_board",
+            ),
+        ];
+
+        for (error, expected_kind) in cases {
+            let result = ipc_target_error_result(&error);
+            assert!(result.is_error);
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some(expected_kind)
+            );
+        }
+    }
+}
+
 // ─── Argument helpers ─────────────────────────────────────────────────────────
 
 /// Build a structured `InvalidArgument` CallToolResult. Used by the
@@ -427,6 +913,28 @@ pub(crate) fn invalid_arg(field: &str, reason: &str) -> CallToolResult {
             reason: reason.to_string(),
         },
         format!("Argument '{}' is invalid: {}", field, reason),
+    )
+}
+
+/// Report that a write completed but its immediate readback could not prove
+/// the requested state. Callers must not turn this into a stale-target refusal:
+/// the file may already contain the mutation or an external follow-up edit.
+pub(crate) fn mutation_outcome_uncertain(
+    path: &std::path::Path,
+    operation: &str,
+    reason: impl Into<String>,
+) -> CallToolResult {
+    let path = path.display().to_string();
+    let reason = reason.into();
+    CallToolResult::error_kind(
+        crate::mcp::error::ToolErrorKind::MutationOutcomeUncertain {
+            operation: operation.to_owned(),
+            path: path.clone(),
+            reason: reason.clone(),
+        },
+        format!(
+            "{operation} committed a schematic mutation, but immediate readback did not prove the requested result. The file at '{path}' may have changed; reload and inspect it before retrying. {reason}"
+        ),
     )
 }
 
@@ -489,6 +997,40 @@ pub fn opt_f64(args: &Value, key: &str) -> Option<f64> {
     args[key].as_f64()
 }
 
+/// Extract an optional positive f64. Unlike [`opt_f64`], a malformed present
+/// value is not treated as omission, and zero/negative values are refused.
+pub fn opt_positive_f64(args: &Value, key: &str) -> Result<Option<f64>, CallToolResult> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        value => match value.as_f64() {
+            Some(number) if number > 0.0 => Ok(Some(number)),
+            Some(_) => Err(invalid_arg(key, "must be greater than zero")),
+            None => Err(invalid_arg(key, "must be a number greater than zero")),
+        },
+    }
+}
+
+/// Extract an optional u32 while accepting either JSON spelling of an integer
+/// (`2` and `2.0`). Fractions, negative values, and overflow are refused
+/// instead of being silently narrowed by `as u32`. Domain-specific lower
+/// bounds remain with the caller so it can preserve a more useful diagnostic.
+pub fn opt_u32(args: &Value, key: &str) -> Result<Option<u32>, CallToolResult> {
+    let value = match &args[key] {
+        Value::Null => return Ok(None),
+        value => value,
+    };
+    let Some(number) = value.as_f64() else {
+        return Err(invalid_arg(key, "must be a non-negative integer"));
+    };
+    if number < 0.0 || number.fract() != 0.0 {
+        return Err(invalid_arg(key, "must be a non-negative integer"));
+    }
+    if number > f64::from(u32::MAX) {
+        return Err(invalid_arg(key, "is out of range for a 32-bit unit number"));
+    }
+    Ok(Some(number as u32))
+}
+
 /// Extract a required array argument. Returns a structured `InvalidArgument`
 /// error result if missing or not an array.
 ///
@@ -508,6 +1050,23 @@ pub fn require_u64(args: &Value, key: &str) -> Result<u64, CallToolResult> {
     args[key]
         .as_u64()
         .ok_or_else(|| invalid_arg(key, "missing or not a non-negative integer"))
+}
+
+/// `ipc_failure` evidence for a response that pinged KiCad: `null` when the
+/// Ping succeeded with `AS_OK`, otherwise `{kind, message}` naming why it did
+/// not (#532). A request that did not complete is a `request_failed` failure,
+/// not a success, whether or not it reached KiCad.
+///
+/// `kind` comes from the typed [`konnect_ipc::PingOutcome`] — never from the
+/// message — so a caller can branch on it: `not_configured`, `no_listener`,
+/// `access_denied`, `handshake_failed`, `transport_error`, or
+/// `request_failed` for a request that did not complete and may have reached
+/// the endpoint (an explicit KiCad status in `message` proves receipt).
+pub fn ipc_failure_evidence(outcome: &konnect_ipc::PingOutcome) -> Value {
+    match (outcome.failure_kind(), outcome.failure_message()) {
+        (Some(kind), Some(message)) => serde_json::json!({ "kind": kind, "message": message }),
+        _ => Value::Null,
+    }
 }
 
 /// A required argument was absent or the wrong type.
@@ -612,21 +1171,35 @@ pub(crate) fn placed_pins(
         .collect()
 }
 
+/// Whether a reference belongs to a symbol that names a net rather than
+/// consuming one — a power symbol, a `PWR_FLAG`. KiCAD prefixes those with `#`
+/// and keeps them out of the netlist as components.
+///
+/// Deliberately not `LabelKind::PowerSymbol`, which `extract_power_symbol_labels`
+/// derives from the `(power)` marker plus a `power_in` pin: `PWR_FLAG`'s pin is
+/// `power_out`, so that test lets it through, and a caller counting what a net
+/// actually reaches wants it out too.
+pub(crate) fn is_power_symbol_reference(reference: &str) -> bool {
+    reference.starts_with('#')
+}
+
+/// Each placed symbol instance with the pins it put on the sheet, as
+/// [`placed_pins_by_reference`] reports them.
+pub(crate) type PlacedPinsByReference = Vec<(
+    konnect_sexp::schematic::SymbolInstance,
+    Vec<(
+        konnect_sexp::schematic::LibPin,
+        konnect_sexp::geometry::PinTransform,
+    )>,
+)>;
+
 /// [`placed_pins`], grouped under the instance that placed each unit, for
 /// callers that report pins by name rather than position. The whole instance
 /// is returned because a caller reporting a pin usually wants its reference
 /// *and* something else about the component — value, uuid, unit — and a
 /// reference alone collapses on a pre-annotation sheet where every part is
 /// `R?`.
-pub(crate) fn placed_pins_by_reference(
-    tree: &konnect_sexp::SexpNode,
-) -> Vec<(
-    konnect_sexp::schematic::SymbolInstance,
-    Vec<(
-        konnect_sexp::schematic::LibPin,
-        konnect_sexp::geometry::PinTransform,
-    )>,
-)> {
+pub(crate) fn placed_pins_by_reference(tree: &konnect_sexp::SexpNode) -> PlacedPinsByReference {
     use konnect_sexp::schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
     };
@@ -651,6 +1224,25 @@ pub(crate) fn placed_pins_by_reference(
     }
     by_reference
 }
+
+/// [`placed_pins_by_reference`], but only when *every* placed symbol resolved.
+///
+/// A `lib_symbols` lookup that failed is stale state, not evidence that the
+/// symbol has no pins, so a caller deciding what is attached to a coordinate
+/// must be able to tell the two apart. `None` says the sheet cannot answer;
+/// it never means "no pins here".
+pub(crate) fn resolved_placed_pins_by_reference(
+    tree: &konnect_sexp::SexpNode,
+) -> Option<PlacedPinsByReference> {
+    let grouped = placed_pins_by_reference(tree);
+    let placed = konnect_sexp::schematic::extract_symbol_instances(tree).len();
+    (grouped.len() == placed).then_some(grouped)
+}
+
+/// The reason a sheet cannot answer for its own pins, shared by every caller
+/// that refuses on [`resolved_placed_pins_by_reference`] returning `None`.
+pub(crate) const UNRESOLVED_PIN_GEOMETRY: &str =
+    "one or more placed symbols have unresolved library pin geometry";
 
 /// All symbol pin connection points in a parsed schematic tree. These drive
 /// junction insertion, and a dot dropped on a phantom pin where two wires
@@ -700,6 +1292,13 @@ pub(crate) struct StubDirection {
     pub dx: f64,
     pub dy: f64,
     pub label_rotation: f64,
+}
+
+impl StubDirection {
+    /// Where a stub of `length` mm from `anchor` ends, and its label sits.
+    pub(crate) fn end(&self, (x, y): (f64, f64), length: f64) -> (f64, f64) {
+        (x + self.dx * length, y + self.dy * length)
+    }
 }
 
 /// Resolve a `direction` argument against an already-known outward direction.
@@ -1711,6 +2310,27 @@ pub(crate) fn sheet_instance_context(
     })
 }
 
+/// Symbols named per distinct diagnosis before the rest become a count.
+const STALE_IDENTITY_SAMPLE: usize = 3;
+/// Distinct diagnoses spelled out before the rest become a count.
+const STALE_DIAGNOSIS_SAMPLE: usize = 5;
+
+/// Render at most `limit` of `items` with `render` and count the remainder, so
+/// a diagnostic cannot grow with the size of the sheet it describes. Only the
+/// named items are rendered.
+fn join_bounded<T>(items: &[T], limit: usize, render: impl Fn(&T) -> String) -> String {
+    let named = items.len().min(limit);
+    let mut joined = items[..named]
+        .iter()
+        .map(&render)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > named {
+        joined.push_str(&format!(" and {} more", items.len() - named));
+    }
+    joined
+}
+
 /// Prove that every existing placed symbol is keyed to exactly the hierarchy
 /// identities observed from the parsed project root.
 ///
@@ -1731,11 +2351,29 @@ pub(crate) fn validate_sheet_instance_state(
         .collect::<Vec<_>>();
     expected.sort();
 
+    // Never sampled. An instance list has one entry per placement of the sheet
+    // in the hierarchy, not one per symbol, so it is not what grew with the
+    // sheet — and it is the list the caller has to write back to clear the
+    // refusal, so an elided entry makes the answer unactionable. It is also the
+    // grouping key below: sampling it would merge symbols that are stale in
+    // genuinely different ways.
+    fn format_paths(paths: &[(String, String)]) -> String {
+        paths
+            .iter()
+            .map(|(project, path)| format!("{project}:{path}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn reference_prefix(reference: &str) -> &str {
         reference.trim_end_matches(|character: char| character.is_ascii_digit() || character == '?')
     }
 
-    let mut stale_symbols = Vec::new();
+    // One entry per distinct diagnosis, in first-seen order, each naming the
+    // symbols that share it. The overwhelmingly common stale sheet has every
+    // symbol disagreeing the same way, so it collapses to a single entry.
+    let mut stale_symbols: Vec<(String, Vec<String>)> = Vec::new();
+    let mut grouped: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for symbol in &schematic.symbols {
         let instances = symbol.instances();
         let mut observed = instances
@@ -1767,24 +2405,13 @@ pub(crate) fn validate_sheet_instance_state(
         });
         if malformed || observed != expected || wrong_unit || wrong_reference {
             let identity = symbol_reference.unwrap_or(symbol.uuid.as_str());
-            let format_paths = |paths: &[(String, String)]| {
-                paths
-                    .iter()
-                    .map(|(project, path)| format!("{project}:{path}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
             let mut reasons = Vec::new();
             if malformed {
                 reasons
                     .push("missing or malformed project/path/reference/unit metadata".to_string());
             }
             if observed != expected {
-                reasons.push(format!(
-                    "observed [{}], expected [{}]",
-                    format_paths(&observed),
-                    format_paths(&expected)
-                ));
+                reasons.push(format!("observed [{}]", format_paths(&observed)));
             }
             if wrong_unit {
                 reasons.push(format!(
@@ -1795,22 +2422,53 @@ pub(crate) fn validate_sheet_instance_state(
             if wrong_reference {
                 reasons.push("instance reference identity disagrees with the symbol".to_string());
             }
-            stale_symbols.push(format!("{identity}: {}", reasons.join(", ")));
+            let diagnosis = reasons.join(", ");
+            match grouped.get(&diagnosis) {
+                Some(&index) => stale_symbols[index].1.push(identity.to_string()),
+                None => {
+                    grouped.insert(diagnosis.clone(), stale_symbols.len());
+                    stale_symbols.push((diagnosis, vec![identity.to_string()]));
+                }
+            }
         }
     }
 
     if stale_symbols.is_empty() {
-        Ok(())
-    } else {
-        Err(SchematicTargetError::StaleTarget {
-            target: sch_path.to_path_buf(),
-            reason: format!(
-                "placed-symbol instance metadata disagrees with project '{}': {}",
-                context.project_name,
-                stale_symbols.join("; ")
+        return Ok(());
+    }
+
+    let stale_count = stale_symbols
+        .iter()
+        .map(|(_, identities)| identities.len())
+        .sum::<usize>();
+    let mut diagnoses = stale_symbols
+        .iter()
+        .take(STALE_DIAGNOSIS_SAMPLE)
+        .map(|(diagnosis, identities)| match identities.as_slice() {
+            [identity] => format!("{identity}: {diagnosis}"),
+            _ => format!(
+                "{} ({} symbols): {diagnosis}",
+                join_bounded(identities, STALE_IDENTITY_SAMPLE, String::clone),
+                identities.len()
             ),
         })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let undisclosed = stale_symbols.len().saturating_sub(STALE_DIAGNOSIS_SAMPLE);
+    if undisclosed > 0 {
+        diagnoses.push_str(&format!("; and {undisclosed} further distinct diagnoses"));
     }
+    Err(SchematicTargetError::StaleTarget {
+        target: sch_path.to_path_buf(),
+        reason: format!(
+            "placed-symbol instance metadata disagrees with project '{}': \
+             {stale_count} of {} placed symbols are stale; every symbol must record \
+             exactly [{}]; {diagnoses}",
+            context.project_name,
+            schematic.symbols.len(),
+            format_paths(&expected)
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -2313,5 +2971,32 @@ pub(crate) mod schematic_target_tests {
             crate::mcp::error::extract_error_kind(&result).as_deref(),
             Some("conflict")
         );
+    }
+}
+
+#[cfg(test)]
+mod ipc_failure_evidence_tests {
+    use super::ipc_failure_evidence;
+    use konnect_ipc::{PingOutcome, UnreachableReason};
+
+    #[test]
+    fn a_responsive_endpoint_has_no_failure() {
+        assert!(ipc_failure_evidence(&PingOutcome::Responsive).is_null());
+    }
+
+    #[test]
+    fn the_kind_is_the_typed_reason_and_the_message_is_kept() {
+        let evidence = ipc_failure_evidence(&PingOutcome::Unreachable {
+            reason: UnreachableReason::AccessDenied,
+            message: "refused".to_string(),
+        });
+        assert_eq!(evidence["kind"], "access_denied");
+        assert_eq!(evidence["message"], "refused");
+
+        let evidence = ipc_failure_evidence(&PingOutcome::RequestFailed {
+            message: "AS_NOT_READY".to_string(),
+        });
+        assert_eq!(evidence["kind"], "request_failed");
+        assert_eq!(evidence["message"], "AS_NOT_READY");
     }
 }

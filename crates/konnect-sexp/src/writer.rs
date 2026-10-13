@@ -110,7 +110,15 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
 }
 
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    ensure_kicad_schematic_is_closed(path)?;
+    write_atomic_unlocked_with(path, content, || {})
+}
+
+fn write_atomic_unlocked_with(
+    path: &Path,
+    content: &str,
+    before_replace: impl FnOnce(),
+) -> Result<(), SexpError> {
+    ensure_kicad_design_document_is_closed(path)?;
     let (tmp_path, mut file) = create_scratch_file(path)?;
 
     // Remove the scratch file unless the rename below succeeds.
@@ -127,7 +135,8 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), Se
 
     // A lock may have appeared while the scratch file was being written.
     // Recheck at the last refusal point before replacing the document.
-    ensure_kicad_schematic_is_closed(path)?;
+    before_replace();
+    ensure_kicad_design_document_is_closed(path)?;
     std::fs::rename(&tmp_path, path)?;
     cleanup.disarm();
     sync_parent_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -205,39 +214,72 @@ pub(crate) fn open_document_lock(path: &Path) -> Result<std::fs::File, SexpError
     open_lock_file(&lock_path)
 }
 
-/// Refuse a `.kicad_sch` mutation while KiCad's sibling lock is present.
+/// Refuse a `.kicad_sch` or `.kicad_pcb` mutation while KiCad's sibling lock
+/// is present.
 ///
 /// KiCad 10 writes only `username` and `hostname` into this file. There is no
 /// PID, process start time, or document token with which to prove that a lock
 /// is stale, especially for another host. Its contents are therefore neither
 /// parsed nor trusted: any filesystem entry at the lock path blocks the write.
-/// Reads and non-schematic writes are unaffected.
-pub(crate) fn ensure_kicad_schematic_is_closed(path: &Path) -> Result<(), SexpError> {
-    let Some(lock_path) = kicad_schematic_lock_path(path) else {
+/// Reads and non-design-document writes are unaffected.
+pub(crate) fn ensure_kicad_design_document_is_closed(path: &Path) -> Result<(), SexpError> {
+    let Some(lock_path) = kicad_editor_lock_path(path) else {
         return Ok(());
     };
 
-    match std::fs::symlink_metadata(&lock_path) {
+    ensure_kicad_design_document_is_closed_with(path, &lock_path, |path| {
+        std::fs::symlink_metadata(path).map(|_| ())
+    })
+}
+
+fn ensure_kicad_design_document_is_closed_with(
+    path: &Path,
+    lock_path: &Path,
+    inspect: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), SexpError> {
+    match inspect(lock_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) | Err(_) => Err(SexpError::KiCadEditorLocked {
+        Ok(()) => Err(SexpError::KiCadEditorLocked {
             path: path.to_path_buf(),
-            lock_path,
+            lock_path: lock_path.to_path_buf(),
+            inspection_error: None,
+        }),
+        Err(error) => Err(SexpError::KiCadEditorLocked {
+            path: path.to_path_buf(),
+            lock_path: lock_path.to_path_buf(),
+            inspection_error: Some(error.to_string()),
         }),
     }
 }
 
-fn kicad_schematic_lock_path(path: &Path) -> Option<PathBuf> {
-    let is_schematic = path
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("kicad_sch"));
-    if !is_schematic {
+/// KiCad's sibling editor-lock path for a schematic or board document:
+/// `~<filename>.lck` in the same directory.
+///
+/// This derives identity only; callers decide what an observed or unreadable
+/// lock means for their operation. Other file types return `None` so a caller
+/// cannot accidentally treat an unrelated tilde file as editor state.
+pub fn kicad_editor_lock_path(path: &Path) -> Option<PathBuf> {
+    let resolved = path.canonicalize().unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    });
+    let is_design_document =
+        resolved
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("kicad_sch")
+                    || extension.eq_ignore_ascii_case("kicad_pcb")
+            });
+    if !is_design_document {
         return None;
     }
     let mut name = OsString::from("~");
-    name.push(path.file_name()?);
+    name.push(resolved.file_name()?);
     name.push(".lck");
-    Some(path.with_file_name(name))
+    Some(resolved.with_file_name(name))
 }
 
 fn open_lock_file(lock_path: &Path) -> Result<std::fs::File, SexpError> {
@@ -352,22 +394,78 @@ fn hash_native_os_str(hasher: &mut Sha256, value: &OsStr) {
 }
 
 /// Atomically create a new file without replacing an existing destination.
+///
+/// The new file takes the ordinary create mode — `0o666 & !umask` on Unix,
+/// the same as any other newly created file.
 pub fn write_new_atomic(path: &Path, content: &str) -> Result<(), SexpError> {
     let lock = open_document_lock(path)?;
     <std::fs::File as FileExt>::lock(&lock)?;
     write_new_atomic_unlocked(path, content)
 }
 
+/// What a create-only atomic write asks for as the new file's mode.
+///
+/// The replace path copies the destination's mode; a create has no
+/// destination to copy from, so the caller has to say what the file is.
+#[derive(Clone, Copy)]
+enum NewFileMode {
+    /// A design file or an exported artifact: `0o666 & !umask`, the mode the
+    /// platform would give any other newly created file.
+    Ordinary,
+    /// Owner read/write and nothing else, whatever the umask says.
+    Private,
+}
+
 pub(crate) fn write_new_atomic_unlocked(path: &Path, content: &str) -> Result<(), SexpError> {
-    ensure_kicad_schematic_is_closed(path)?;
+    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Ordinary)
+}
+
+/// Create-only atomic write for content that must not leave the owner.
+pub(crate) fn write_new_atomic_unlocked_private(
+    path: &Path,
+    content: &str,
+) -> Result<(), SexpError> {
+    write_new_atomic_unlocked_with_mode(path, content, NewFileMode::Private)
+}
+
+fn write_new_atomic_unlocked_with_mode(
+    path: &Path,
+    content: &str,
+    _mode: NewFileMode,
+) -> Result<(), SexpError> {
+    ensure_kicad_design_document_is_closed(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".konnect-")
-        .tempfile_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".konnect-");
+    // `tempfile` creates at 0o600 by design, which then survives the rename
+    // and becomes the created file's permanent mode. Ask for the creation
+    // mode the policy wants instead, and let the kernel apply the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let requested = match _mode {
+            NewFileMode::Ordinary => 0o666,
+            NewFileMode::Private => 0o600,
+        };
+        builder.permissions(std::fs::Permissions::from_mode(requested));
+    }
+    let mut temporary = builder.tempfile_in(parent)?;
+    // A creation mode is only a request: the umask still masks it, so 0o277
+    // would leave private content at 0o400 and 0o677 at 0o000. Owner
+    // read/write is a guarantee here, not a preference, so set it on the open
+    // handle — before any content exists, and by descriptor rather than by
+    // path, so no other name can be chmod-ed instead.
+    #[cfg(unix)]
+    if matches!(_mode, NewFileMode::Private) {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     temporary.write_all(content.as_bytes())?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
-    ensure_kicad_schematic_is_closed(path)?;
+    ensure_kicad_design_document_is_closed(path)?;
     temporary
         .persist_noclobber(path)
         .map_err(|error| SexpError::Io(error.error))?;
@@ -697,6 +795,80 @@ pub fn find_enclosing_direct_child_block(
 /// KiCAD 9+ requires UUIDs to be quoted in S-expressions: `(uuid "abc-123")`.
 pub fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+// ─── Test Support ─────────────────────────────────────────────────────────────
+
+/// Running a file-mode probe in a child process under a chosen umask.
+///
+/// A umask is process-global, so a test that set one would decide the modes of
+/// every file its parallel neighbours write. A probe is an `#[ignore]`d test
+/// that creates files in a directory the parent names; the parent inspects
+/// them once the child has exited.
+#[cfg(all(test, unix))]
+pub(crate) mod mode_probe {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// Names the directory the probe writes into.
+    const PROBE_DIRECTORY: &str = "KONNECT_PROBE_DIR";
+
+    /// Run `probe` under `umask`, and hand back the directory it wrote into.
+    pub(crate) fn run_under_umask(probe: &str, umask: &str) -> tempfile::TempDir {
+        let executable = std::env::current_exe().expect("test binary path");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "umask {umask}; exec \"$0\" --exact --ignored {probe}"
+            ))
+            .arg(&executable)
+            .env(PROBE_DIRECTORY, directory.path())
+            // Keep any lock file a probe happens to need out of the
+            // developer's own state directory.
+            .env("KONNECT_STATE_DIR", directory.path())
+            .output()
+            .expect("probe process runs");
+
+        assert!(
+            output.status.success(),
+            "probe {probe} failed under umask {umask}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        directory
+    }
+
+    /// The directory the parent told this probe to write into.
+    pub(crate) fn directory() -> PathBuf {
+        std::env::var_os(PROBE_DIRECTORY)
+            .map(PathBuf::from)
+            .expect("a probe runs under run_under_umask")
+    }
+
+    /// Permission bits of `path`.
+    pub(crate) fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the probe created this file")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// Assert that `what` is readable and writable by its owner and reachable
+    /// by nobody else — together, exactly `0o600`.
+    pub(crate) fn assert_owner_only(what: &str, mode: u32, umask: &str) {
+        assert_eq!(
+            mode & 0o600,
+            0o600,
+            "{what} must stay readable and writable by its owner under umask {umask}"
+        );
+        assert_eq!(
+            mode & 0o177,
+            0,
+            "{what} must give no group or other access under umask {umask}"
+        );
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -1241,6 +1413,22 @@ mod atomic_write_tests {
     }
 
     #[test]
+    fn kicad_editor_lock_path_is_exact_for_schematics_and_boards() {
+        assert_eq!(
+            kicad_editor_lock_path(Path::new("project/design.kicad_sch")),
+            Some(PathBuf::from("project/~design.kicad_sch.lck"))
+        );
+        assert_eq!(
+            kicad_editor_lock_path(Path::new("project/design.kicad_pcb")),
+            Some(PathBuf::from("project/~design.kicad_pcb.lck"))
+        );
+        assert_eq!(
+            kicad_editor_lock_path(Path::new("project/design.kicad_pro")),
+            None
+        );
+    }
+
+    #[test]
     fn conditional_write_rejects_a_kicad_schematic_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("design.kicad_sch");
@@ -1262,8 +1450,10 @@ mod atomic_write_tests {
             error,
             SexpError::KiCadEditorLocked {
                 path: blocked_path,
-                lock_path
-            } if blocked_path.ends_with("design.kicad_sch") && lock_path == lock
+                lock_path,
+                ..
+            } if blocked_path.ends_with("design.kicad_sch")
+                && lock_path.ends_with("~design.kicad_sch.lck")
         ));
     }
 
@@ -1300,16 +1490,63 @@ mod atomic_write_tests {
     }
 
     #[test]
-    fn kicad_lock_name_does_not_block_a_non_schematic_write() {
+    fn conditional_write_rejects_a_kicad_board_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("design.kicad_pcb");
         let lock = directory.path().join("~design.kicad_pcb.lck");
         std::fs::write(&path, "expected").unwrap();
-        std::fs::write(lock, "not relevant to this shared writer").unwrap();
+        std::fs::write(&lock, "editor state cannot be proven stale").unwrap();
 
-        write_atomic_if_unchanged(&path, "expected", "edited").unwrap();
+        let error = write_atomic_if_unchanged(&path, "expected", "edited").unwrap_err();
 
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "edited");
+        assert!(matches!(
+            error,
+            SexpError::KiCadEditorLocked {
+                path: blocked_path,
+                lock_path,
+                ..
+            } if blocked_path == path && lock_path.ends_with("~design.kicad_pcb.lck")
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "expected");
+    }
+
+    #[test]
+    fn an_uninspectable_board_lock_retains_distinct_evidence() {
+        let path = Path::new("design.kicad_pcb");
+        let lock = Path::new("~design.kicad_pcb.lck");
+
+        let error = ensure_kicad_design_document_is_closed_with(path, lock, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "mock access denied",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SexpError::KiCadEditorLocked {
+                inspection_error: Some(message),
+                ..
+            } if message.contains("mock access denied")
+        ));
+    }
+
+    #[test]
+    fn a_lock_appearing_after_the_first_gate_blocks_atomic_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("design.kicad_pcb");
+        let lock = directory.path().join("~design.kicad_pcb.lck");
+        std::fs::write(&path, "expected").unwrap();
+
+        let error = write_atomic_unlocked_with(&path, "replacement", || {
+            std::fs::write(&lock, "appeared during write").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, SexpError::KiCadEditorLocked { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "expected");
+        assert!(lock.exists());
     }
 
     #[test]
@@ -1364,6 +1601,85 @@ mod atomic_write_tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_create_honors_the_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("solo.kicad_sch");
+
+        write_new_atomic(&path, "(kicad_sch)").unwrap();
+
+        // Covers the public, locked entry point under whatever umask this run
+        // happens to have; the probe test below pins the policy itself across
+        // chosen umasks. An ordinary create in the same directory draws the
+        // mode the kernel gives a 0o666 open, so the comparison holds under
+        // any umask while still failing for tempfile's 0o600 default.
+        let control = directory.path().join("control");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&control)
+            .unwrap();
+        let expected = std::fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+        let actual = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+
+        assert_eq!(
+            actual, expected,
+            "a created design file must follow the umask, not tempfile's 0o600 default"
+        );
+    }
+
+    #[cfg(unix)]
+    const CREATED_MODE_PROBE: &str = "writer::atomic_write_tests::report_created_file_modes";
+    #[cfg(unix)]
+    const ORDINARY_PROBE_FILE: &str = "solo.kicad_sch";
+    #[cfg(unix)]
+    const PRIVATE_PROBE_FILE: &str = ".konnect-private.json";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "probe: run by created_file_modes_follow_the_creation_policy under an explicit umask"]
+    fn report_created_file_modes() {
+        let directory = mode_probe::directory();
+
+        write_new_atomic_unlocked(&directory.join(ORDINARY_PROBE_FILE), "(kicad_sch)").unwrap();
+        write_new_atomic_unlocked_private(&directory.join(PRIVATE_PROBE_FILE), "{}").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_file_modes_follow_the_creation_policy() {
+        // The ordinary expectations are POSIX's promise for a create that asks
+        // for 0o666 — `0o666 & !umask` — written out as literals rather than
+        // recomputed from the writer, so changing the writer cannot move them.
+        // 0o277 and 0o677 are the cases that matter for private content: they
+        // mask owner bits, so a creation mode alone would leave private
+        // content at 0o400 or 0o000.
+        for (umask, ordinary) in [
+            ("000", 0o666),
+            ("002", 0o664),
+            ("022", 0o644),
+            ("077", 0o600),
+            ("277", 0o400),
+            ("677", 0o000),
+        ] {
+            let directory = mode_probe::run_under_umask(CREATED_MODE_PROBE, umask);
+
+            assert_eq!(
+                mode_probe::mode_of(&directory.path().join(ORDINARY_PROBE_FILE)),
+                ordinary,
+                "a created design file must be 0o666 & !umask under umask {umask}"
+            );
+            mode_probe::assert_owner_only(
+                "private content",
+                mode_probe::mode_of(&directory.path().join(PRIVATE_PROBE_FILE)),
+                umask,
+            );
+        }
     }
 
     #[test]

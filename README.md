@@ -13,7 +13,7 @@
 Rust binary — that lets Claude and other AI assistants design schematics and PCBs
 through the [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 
-**225 tools across 20 on-demand toolsets.** Schematic capture, PCB layout and
+**232 tools across 21 on-demand toolsets.** Schematic capture, PCB layout and
 routing, ERC/DRC, design-review audits, JLCPCB part search, reference
 circuits, and a full manufacturing export pipeline — with bundled skills and agents
 that teach Claude KiCAD conventions out of the box.
@@ -70,7 +70,7 @@ through its own S-expression engine with atomic writes (write, fsync, rename), U
 preservation, and round-trip tests — no third-party schematic library with known
 gaps, no text-manipulation workarounds.
 
-**Context economy is a feature.** Exposing all 225 tools to an LLM costs roughly 23K
+**Context economy is a feature.** Exposing all 232 tools to an LLM costs roughly 23K
 tokens of context on every listing. Konnect's router loads a starter kit (~2K
 tokens) and lets the model pull in toolsets on demand — plus built-in observability
 (`get_recent_calls`, `server_stats`, JSONL call logs) so the model can diagnose its
@@ -109,6 +109,11 @@ The full tool catalog is documented in [tool-directory.md](tool-directory.md).
 | Specctra routing | Revision-bound Rust DSN export, local Freerouting MCP routing, and strict one-transaction SES import; an authenticated KiCad 10 native-export bridge is explicit opt-in |
 | Exports & checks | `kicad-cli` subprocess (Gerber, PDF, ERC, DRC, …) |
 | Transport | MCP JSON-RPC over stdio (default), or Streamable HTTP (`transport = "http"` / `"both"`) |
+
+Explore the request path and safety boundaries in the
+[interactive architecture diagrams](docs/ARCHITECTURE_DIAGRAMS.md). They are
+published from a standalone documentation repository and add no dependencies to
+Konnect.
 
 ## Installation
 
@@ -173,7 +178,18 @@ konnect uninstall --client codex
 
 MCP server startup never installs or restores guidance. Run `konnect init`
 explicitly when you want those files installed; after `konnect uninstall`,
-starting the server leaves them removed. `--client` remains accepted in server
+starting the server leaves them removed.
+
+Guidance written by an older `konnect init` is not updated by upgrading the
+binary. `konnect status` compares every installed skill, agent, and hook with
+the bundle in the binary you run and marks each `current`, `different`, or
+`missing`. The server makes the same check once for each installed version:
+the first start after `konnect init` compares the files, records
+the result in `~/.konnect`, and adds a one-line notice to its `initialize`
+instructions if guidance is out of sync. Later starts reuse that record, so
+guidance you chose to keep is not reported again. `get_installation_info`
+shows the result. Re-run `konnect init` to update it.
+It overwrites differing files, so keep a copy of any file you edited. `--client` remains accepted in server
 commands for compatibility. For example, register a standalone binary with the
 Codex CLI using:
 
@@ -297,11 +313,11 @@ the main workspace — see [DEV.md](DEV.md) for build steps.
   tracked on the [roadmap](ROADMAP.md))
 - `kicad-cli` (ships with KiCAD — used for exports, ERC, DRC)
 - For most PCB tools: KiCAD running with the target board open (IPC API).
-  `place_component`, `move_component`, and `rotate_component` can safely fall
-  back to a closed board file when IPC is unreachable. `flip_component`
-  flips over IPC with PixelCad's `FlipItems` when KiCAD holds the board, and
-  otherwise flips a closed board file; stock KiCAD has no flip command, so
-  there it requires the board closed.
+  `place_component`, `move_component`, `rotate_component`, and (on KiCAD
+  10.0.6+) `flip_component` can safely fall back to a closed board file when
+  IPC is unreachable. An older reachable KiCAD makes `flip_component` fail
+  closed with `unsupported_capability`; it never edits the file underneath a
+  live editor that cannot perform the native flip.
 
 ## License: free for the little guys
 
@@ -340,9 +356,10 @@ manual copy), then restart KiCAD.
 with that board first; most PCB tools talk to the running PCB editor. Only an
 unreachable KiCAD produces that message: if KiCAD is running and the tool
 refuses anyway, the error is the tool's own reason for refusing.
-`place_component`, `move_component`, and `rotate_component` can fall back to a
-closed board file when no KiCAD process is reachable; `flip_component`
-does too, and on a board KiCAD holds open it needs PixelCad's `FlipItems` IPC command.
+`place_component`, `move_component`, `rotate_component`, and (on KiCAD
+10.0.6+) `flip_component` can fall back to a closed board file when no KiCAD
+process is reachable. An older, reachable KiCAD makes `flip_component` refuse
+rather than silently editing the file underneath it.
 
 See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for socket setup, tools
 that don't appear after `load_toolset`, and transaction recovery.

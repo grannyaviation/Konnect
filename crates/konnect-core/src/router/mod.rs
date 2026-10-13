@@ -143,6 +143,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loaded_tools_reuse_their_compiled_input_schema() {
+        let router = ToolRouter::new();
+        router.load("project").await.expect("known toolset");
+
+        let first = router
+            .get_tool("create_project")
+            .await
+            .expect("loaded tool");
+        let second = router
+            .get_tool("create_project")
+            .await
+            .expect("loaded tool");
+        assert!(std::sync::Arc::ptr_eq(
+            &first.input_validator,
+            &second.input_validator
+        ));
+
+        let catalogue_first = registry::tools_for("project").expect("registered toolset");
+        let catalogue_second = registry::tools_for("project").expect("registered toolset");
+        assert!(std::sync::Arc::ptr_eq(
+            &catalogue_first[0].input_validator,
+            &catalogue_second[0].input_validator
+        ));
+    }
+
+    #[test]
+    fn every_registered_input_schema_is_valid_draft_2020_12() {
+        for toolset in registry::ALL_TOOLSETS {
+            for tool in registry::tools_for(toolset.name).expect("registered toolset") {
+                assert!(
+                    jsonschema::draft202012::meta::is_valid(&tool.input_schema),
+                    "{} has an invalid input schema",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_records_are_closed_and_only_reviewed_maps_are_extensible() {
+        fn visit(value: &serde_json::Value, path: &str) {
+            if value["type"] == "object"
+                || value["type"]
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|t| t == "object"))
+                || value.get("properties").is_some()
+                || value.get("patternProperties").is_some()
+            {
+                let policy = value
+                    .get("additionalProperties")
+                    .expect("every record has an explicit policy");
+                if policy != false {
+                    assert!(
+                        matches!(path,
+                        "edit_schematic_component/properties/fields" |
+                        "edit_schematic_component/properties/field_placements" |
+                        "batch_edit_schematic_components/properties/edits/items/properties/fields" |
+                        "copy_routing_pattern/properties/net_map" |
+                        "apply_template/properties/net_mappings"
+                    ),
+                        "unreviewed open input record: {path}"
+                    );
+                }
+            }
+            // Traverse schema positions, not object-valued defaults/examples.
+            for keyword in [
+                "properties",
+                "patternProperties",
+                "$defs",
+                "definitions",
+                "dependentSchemas",
+            ] {
+                if let Some(children) = value[keyword].as_object() {
+                    for (key, child) in children {
+                        visit(child, &format!("{path}/{keyword}/{key}"));
+                    }
+                }
+            }
+            for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+                if let Some(children) = value[keyword].as_array() {
+                    for (index, child) in children.iter().enumerate() {
+                        visit(child, &format!("{path}/{keyword}/{index}"));
+                    }
+                }
+            }
+            for keyword in [
+                "items",
+                "additionalProperties",
+                "contains",
+                "propertyNames",
+                "not",
+                "if",
+                "then",
+                "else",
+                "unevaluatedProperties",
+                "unevaluatedItems",
+            ] {
+                if let Some(child) = value.get(keyword) {
+                    visit(child, &format!("{path}/{keyword}"));
+                }
+            }
+        }
+        for meta in registry::ALL_TOOLSETS {
+            for tool in registry::tools_for(meta.name).unwrap() {
+                visit(&tool.input_schema, tool.name);
+            }
+        }
+        for tool in meta_tools::meta_tool_descriptions_for(true) {
+            visit(&tool.input_schema, &tool.name);
+        }
+    }
+
+    #[tokio::test]
     async fn starter_kit_loads_expected_toolsets_and_nothing_more() {
         let router = ToolRouter::new();
         router.load_starter_kit().await;

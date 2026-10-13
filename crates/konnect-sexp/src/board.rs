@@ -31,6 +31,7 @@
 
 use crate::net;
 use crate::parser::SexpNode;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Every footprint on a board, in file order.
@@ -352,34 +353,199 @@ pub fn lossless_zone_outlines(tree: &SexpNode) -> Scan<LosslessZoneOutline> {
     Scan { items, skipped }
 }
 
-/// Bounding box `(min_x, min_y, max_x, max_y)` of the board outline: every
-/// `Edge.Cuts` graphic that is a direct child of `(kicad_pcb …)` — `gr_line`,
-/// `gr_rect`, `gr_arc`, `gr_circle`, `gr_curve`.
+/// The board outline's proven geometry class (#594).
 ///
-/// Arcs use exact extrema ([`crate::geometry::arc_bbox`]): a board whose
-/// outline bulges through a fillet or a semicircular edge is wider than its
-/// endpoints say. Bézier `gr_curve`s use the control-point hull, which is a
-/// (tight enough) superset of the curve.
+/// A bounding box is not the outline: for any board whose Edge.Cuts shape is
+/// not a rectangle — concave, notched, rounded, or just rotated — a point
+/// can sit inside the bbox while outside the true board. Every containment
+/// claim that matters (does this footprint fit, is this plan in bounds) has
+/// to know which case it is in rather than silently trusting the bbox.
 ///
-/// All-or-nothing: `None` when there are no Edge.Cuts graphics **or when any
-/// of them is malformed**. A partial outline bbox looks exactly like a
-/// finished one and silently mis-sizes the board, so a single broken edge
-/// graphic invalidates the answer rather than shrinking it.
-pub fn board_outline_bbox(tree: &SexpNode) -> Option<(f64, f64, f64, f64)> {
-    const EDGE_TAGS: [&str; 5] = ["gr_line", "gr_rect", "gr_arc", "gr_circle", "gr_curve"];
+/// This type draws the line **without** implementing a polygon/arc/cutout
+/// containment engine: it classifies whether the parsed Edge.Cuts geometry
+/// is *provably* an axis-aligned rectangle (in which case bbox containment
+/// is exact, not an approximation) or merely *parses* into some other shape
+/// the bbox cannot prove anything about.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutlineShape {
+    /// No Edge.Cuts graphics, or any one of them malformed — the same
+    /// all-or-nothing rule [`board_outline_bbox`] always used.
+    Missing,
+    /// Provably an axis-aligned rectangle: a single `gr_rect`, a single
+    /// 4-vertex `gr_poly` whose edges, in order, are the rectangle's four
+    /// sides, or exactly four `gr_line` segments that are its four sides,
+    /// each once. Bbox containment against this shape is exact containment,
+    /// not an approximation.
+    Rectangular { bbox: (f64, f64, f64, f64) },
+    /// Edge.Cuts geometry that parses cleanly but is not provably
+    /// rectangular — any arc, circle, or curve; a rotated or non-4-vertex
+    /// `gr_poly`; more than one boundary element. The bbox is reported for
+    /// advisory display only; it is never a containment proof.
+    Unproven { bbox: (f64, f64, f64, f64) },
+}
+
+impl OutlineShape {
+    /// The advisory bbox, present for every class except `Missing`.
+    pub fn bbox(self) -> Option<(f64, f64, f64, f64)> {
+        match self {
+            OutlineShape::Missing => None,
+            OutlineShape::Rectangular { bbox } | OutlineShape::Unproven { bbox } => Some(bbox),
+        }
+    }
+}
+
+const EDGE_TAGS: [&str; 6] = [
+    "gr_line",
+    "gr_rect",
+    "gr_arc",
+    "gr_circle",
+    "gr_curve",
+    "gr_poly",
+];
+
+/// Classify the board outline's proven shape — see [`OutlineShape`].
+pub fn board_outline_shape(tree: &SexpNode) -> OutlineShape {
     let mut acc: Option<(f64, f64, f64, f64)> = None;
+    let mut edges: Vec<(&str, &SexpNode)> = Vec::new();
     for child in tree.children().unwrap_or(&[]) {
         let Some(head) = child.head() else { continue };
         if !EDGE_TAGS.contains(&head) || child.find_str("layer") != Some("Edge.Cuts") {
             continue;
         }
-        let bb = graphic_bbox(child, head)?;
+        let Some(bb) = graphic_bbox(child, head) else {
+            return OutlineShape::Missing;
+        };
         acc = Some(match acc {
             None => bb,
             Some((x0, y0, x1, y1)) => (x0.min(bb.0), y0.min(bb.1), x1.max(bb.2), y1.max(bb.3)),
         });
+        edges.push((head, child));
     }
-    acc
+    let Some(bbox) = acc else {
+        return OutlineShape::Missing;
+    };
+    if is_axis_aligned_rectangle(&edges, bbox) {
+        OutlineShape::Rectangular { bbox }
+    } else {
+        OutlineShape::Unproven { bbox }
+    }
+}
+
+/// Whether `edges` (the full Edge.Cuts graphic set, in source order) reduces
+/// to exactly one axis-aligned rectangle: a single `gr_rect`; a single
+/// `gr_poly` whose deduplicated vertices, taken in order, trace the bbox
+/// perimeter; or exactly four `gr_line` segments that are the bbox's four
+/// sides, each exactly once.
+///
+/// Corner membership alone is not a proof: four lines can touch all four
+/// corners while one side is doubled and another missing (an open outline),
+/// and a polygon's four corners in bow-tie order cross itself. Both reduce
+/// to [`is_bbox_perimeter`], which checks the sides, not the points.
+fn is_axis_aligned_rectangle(edges: &[(&str, &SexpNode)], bbox: (f64, f64, f64, f64)) -> bool {
+    let (x0, y0, x1, y1) = bbox;
+    if x0 >= x1 || y0 >= y1 {
+        return false; // Degenerate (zero-area) bbox proves nothing.
+    }
+    // Perimeter order: corner `i` and corner `(i + 1) % 4` share a side.
+    let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+
+    match edges {
+        [("gr_rect", _)] => true,
+        [("gr_poly", node)] => {
+            let Some(pts) = node.find("pts") else {
+                return false;
+            };
+            let mut verts: Vec<(f64, f64)> = Vec::new();
+            for xy in pts.find_all("xy") {
+                let (Some(x), Some(y)) = (xy.get_f64(1), xy.get_f64(2)) else {
+                    return false;
+                };
+                if verts.last() != Some(&(x, y)) {
+                    verts.push((x, y));
+                }
+            }
+            if verts.len() > 1 && verts.first() == verts.last() {
+                verts.pop();
+            }
+            if verts.len() != 4 {
+                return false;
+            }
+            // The polygon closes implicitly: its sides are consecutive
+            // vertex pairs, including last → first.
+            let sides: Vec<_> = (0..4).map(|i| (verts[i], verts[(i + 1) % 4])).collect();
+            is_bbox_perimeter(&sides, &corners)
+        }
+        [("gr_line", _), ("gr_line", _), ("gr_line", _), ("gr_line", _)] => {
+            let mut sides = Vec::with_capacity(4);
+            for (_, node) in edges {
+                let (Some(s), Some(e)) = (point(node, "start"), point(node, "end")) else {
+                    return false;
+                };
+                sides.push((s, e));
+            }
+            is_bbox_perimeter(&sides, &corners)
+        }
+        _ => false,
+    }
+}
+
+/// One straight outline edge, `(start, end)`.
+type Segment = ((f64, f64), (f64, f64));
+
+/// Whether `sides` are exactly the four sides of the rectangle whose
+/// `corners` are given in perimeter order — each side present once, in
+/// either direction. Four such sides are necessarily axis-aligned, connected
+/// and closed, with no diagonal or self-crossing edge: a side joining
+/// opposite corners, a repeated side (which leaves another missing), or an
+/// endpoint off the corners fails.
+fn is_bbox_perimeter(sides: &[Segment], corners: &[(f64, f64); 4]) -> bool {
+    let corner_index = |p: (f64, f64)| corners.iter().position(|c| close(*c, p));
+    let mut seen = [false; 4];
+    for &(a, b) in sides {
+        let (Some(i), Some(j)) = (corner_index(a), corner_index(b)) else {
+            return false;
+        };
+        if j == (i + 1) % 4 {
+            seen[i] = true;
+        } else if i == (j + 1) % 4 {
+            seen[j] = true;
+        } else {
+            return false; // Same corner twice, or opposite corners (a diagonal).
+        }
+    }
+    sides.len() == 4 && seen == [true; 4]
+}
+
+fn close_scalar(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+fn close(a: (f64, f64), b: (f64, f64)) -> bool {
+    close_scalar(a.0, b.0) && close_scalar(a.1, b.1)
+}
+
+/// Bounding box `(min_x, min_y, max_x, max_y)` of the board outline: every
+/// `Edge.Cuts` graphic that is a direct child of `(kicad_pcb …)` — `gr_line`,
+/// `gr_rect`, `gr_arc`, `gr_circle`, `gr_curve`, `gr_poly`.
+///
+/// Arcs use exact extrema ([`crate::geometry::arc_bbox`]): a board whose
+/// outline bulges through a fillet or a semicircular edge is wider than its
+/// endpoints say. Bézier `gr_curve`s use the control-point hull, which is a
+/// (tight enough) superset of the curve. `gr_poly` outlines — KiCad's native
+/// way to draw a non-rectangular or concave board edge — use the same
+/// vertex-hull bbox, but it is exact rather than a superset: polygon edges
+/// are straight, so the vertices *are* the extrema.
+///
+/// All-or-nothing: `None` when there are no Edge.Cuts graphics **or when any
+/// of them is malformed**. A partial outline bbox looks exactly like a
+/// finished one and silently mis-sizes the board, so a single broken edge
+/// graphic invalidates the answer rather than shrinking it.
+///
+/// This bbox is **not** a containment proof for non-rectangular shapes — see
+/// [`board_outline_shape`] and [`OutlineShape`], which every placement
+/// containment check should use instead.
+pub fn board_outline_bbox(tree: &SexpNode) -> Option<(f64, f64, f64, f64)> {
+    board_outline_shape(tree).bbox()
 }
 
 /// Bbox of a single edge graphic; `None` when a load-bearing coordinate is
@@ -403,25 +569,31 @@ fn graphic_bbox(node: &SexpNode, head: &str) -> Option<(f64, f64, f64, f64)> {
             let r = (ex - cx).hypot(ey - cy);
             Some((cx - r, cy - r, cx + r, cy + r))
         }
-        "gr_curve" => {
-            // Cubic Bézier: the control polygon contains the curve, so its
-            // hull is a valid (if slightly loose) bbox.
-            let pts = node.find("pts")?;
-            let mut acc: Option<(f64, f64, f64, f64)> = None;
-            for xy in pts.find_all("xy") {
-                let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
-                if !x.is_finite() || !y.is_finite() {
-                    return None;
-                }
-                acc = Some(match acc {
-                    None => (x, y, x, y),
-                    Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                });
-            }
-            acc
-        }
+        // Cubic Bézier: the control polygon contains the curve, so its hull
+        // is a valid (if slightly loose) bbox.
+        //
+        // gr_poly: a straight-edged polygon, so the same vertex-hull bbox is
+        // exact rather than a superset.
+        "gr_curve" | "gr_poly" => pts_bbox(node),
         _ => None,
     }
+}
+
+/// Bbox of every `(xy x y)` vertex under a node's `pts` child.
+fn pts_bbox(node: &SexpNode) -> Option<(f64, f64, f64, f64)> {
+    let pts = node.find("pts")?;
+    let mut acc: Option<(f64, f64, f64, f64)> = None;
+    for xy in pts.find_all("xy") {
+        let (x, y) = (xy.get_f64(1)?, xy.get_f64(2)?);
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        acc = Some(match acc {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    }
+    acc
 }
 
 /// `(tag x y)` as a finite coordinate pair, or `None` — never a zero-filled
@@ -972,6 +1144,123 @@ impl PcbConnectivityIndex {
     }
 }
 
+// ─── UUID ownership index ─────────────────────────────────────────────────────
+
+/// What owns one UUID-addressable item on a board.
+///
+/// The distinction is structural, never inferred from prose: a node that is a
+/// direct child of `(kicad_pcb …)` is board-owned, and a node nested inside a
+/// `(footprint …)` is owned by that footprint. Nothing here reads a
+/// human-readable description like `"Circle of J1"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ItemOwner {
+    /// A top-level board item. A `(footprint …)` node is itself one of these:
+    /// the footprint is placed on the board, so the node indexes as
+    /// board-owned with `item_kind: "footprint"`, while everything inside it
+    /// indexes as footprint-owned.
+    Board,
+    /// An item inside a footprint — its pads, its `fp_*` artwork, its
+    /// properties. Fabrication geometry here is still fabrication geometry; a
+    /// footprint-owned `Edge.Cuts` circle is a real cutout. Ownership decides
+    /// the remedy (edit the footprint) rather than the validity of a finding.
+    Footprint {
+        /// The reference designator, when the footprint declares one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+        /// The footprint's own UUID, when it has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+}
+
+/// One entry of a board's UUID index: what the item is, where it is drawn, and
+/// what owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemIdentity {
+    /// The node's head, exactly as the board file spells it — `gr_line`,
+    /// `fp_circle`, `pad`, `segment`, `via`, `footprint`, `property`, …
+    pub item_kind: String,
+    /// The item's `(layer "…")`, when it names exactly one.
+    ///
+    /// Multi-layer items spell `(layers "F.Cu" "F.Mask" "F.Paste")` instead;
+    /// those are left `None` rather than reporting the first of several, which
+    /// would be a guess dressed as a fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<String>,
+    /// Board or footprint. See [`ItemOwner`].
+    pub owner: ItemOwner,
+}
+
+/// Collision-aware result of indexing a board UUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UuidIndexEntry {
+    Unique(ItemIdentity),
+    Ambiguous,
+}
+
+/// Index every UUID-carrying node of a board by its UUID.
+///
+/// This is the lookup behind DRC ownership reporting (#413): KiCad's report
+/// items carry the UUID of the offending item but nothing about what owns it,
+/// so a `copper_edge_clearance` hit on a connector's own locking-peg cutout
+/// reads exactly like one on the board's real outline — and the remedies are
+/// opposite. Resolving the report's UUID here answers it structurally.
+///
+/// Every node with a direct `(uuid "…")` child is indexed, at any depth. A
+/// footprint's own UUID maps to the footprint node (board-owned,
+/// `item_kind: "footprint"`); its children map to that footprint.
+///
+/// A board with duplicate UUIDs is malformed; duplicates are retained as an
+/// explicit ambiguity rather than resolved according to file order.
+pub fn uuid_index(tree: &SexpNode) -> HashMap<String, UuidIndexEntry> {
+    let mut out = HashMap::new();
+    index_into(tree, &ItemOwner::Board, &mut out);
+    out
+}
+
+fn index_into(node: &SexpNode, owner: &ItemOwner, out: &mut HashMap<String, UuidIndexEntry>) {
+    let Some(children) = node.children() else {
+        return;
+    };
+    let head = node.head();
+
+    // The node's own UUID belongs to the *enclosing* owner: a footprint's uuid
+    // identifies the footprint, which sits on the board.
+    if let (Some(head), Some(uuid)) = (head, node.find_str("uuid")) {
+        let identity = ItemIdentity {
+            item_kind: head.to_string(),
+            layer: node.find_str("layer").map(str::to_string),
+            owner: owner.clone(),
+        };
+        use std::collections::hash_map::Entry;
+        match out.entry(uuid.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(UuidIndexEntry::Unique(identity));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(UuidIndexEntry::Ambiguous);
+            }
+        }
+    }
+
+    // Children of a footprint are owned by it; everything else inherits.
+    let inner;
+    let child_owner = if head == Some("footprint") {
+        inner = ItemOwner::Footprint {
+            reference: footprint_reference(node),
+            uuid: node.find_str("uuid").map(str::to_string),
+        };
+        &inner
+    } else {
+        owner
+    };
+
+    for child in children {
+        index_into(child, child_owner, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1343,6 +1632,245 @@ mod tests {
         assert_eq!(board_outline_bbox(&tree), None);
     }
 
+    // ─── OutlineShape classification (#594) ────────────────────────────────
+
+    #[test]
+    fn outline_shape_single_gr_rect_is_rectangular() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_rect (start 0 0) (end 100 50) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_four_gr_lines_closing_a_rectangle_is_rectangular() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 173.355 90.17) (end 173.355 136.525) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 121.285 90.17) (end 121.285 136.525) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 173.355 90.17) (end 121.285 90.17) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 121.285 136.525) (end 173.355 136.525) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (121.285, 90.17, 173.355, 136.525)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_axis_aligned_four_vertex_gr_poly_is_rectangular() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts (xy 0 0) (xy 100 0) (xy 100 50) (xy 0 50)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_reversed_and_explicitly_closed_gr_poly_is_rectangular() {
+        // Clockwise, starting mid-perimeter, with the first vertex repeated
+        // at the end: still the four sides once each.
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts (xy 100 50) (xy 100 0) (xy 0 0) (xy 0 50) (xy 100 50)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Rectangular {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_bow_tie_gr_poly_is_unproven() {
+        // All four bbox corners, but in crossing order: the polygon's
+        // implicit sides include both diagonals, so it is not a rectangle.
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts (xy 0 0) (xy 100 50) (xy 100 0) (xy 0 50)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_gr_lines_with_a_doubled_side_and_a_missing_side_are_unproven() {
+        // Every corner is touched and every line is axis-aligned, but the
+        // top side appears twice and the bottom side is missing: the outline
+        // is open.
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 0 0) (end 100 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 100 0) (end 0 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 0 0) (end 0 50) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 100 0) (end 100 50) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven {
+                bbox: (0.0, 0.0, 100.0, 50.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_gr_lines_with_a_diagonal_are_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 0 0) (end 100 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 100 0) (end 100 50) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 100 50) (end 0 50) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 0 50) (end 100 0) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_rotated_rectangle_gr_poly_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts (xy 10 0) (xy 20 10) (xy 10 20) (xy 0 10)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven {
+                bbox: (0.0, 0.0, 20.0, 20.0)
+            }
+        );
+    }
+
+    #[test]
+    fn outline_shape_concave_gr_poly_is_unproven() {
+        // The real-KiCad concave L-shaped fixture from gr_poly_outline.kicad_pcb.
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_poly (pts \
+                (xy 154.48 116.96) (xy 116.48 116.96) (xy 116.48 103.96) (xy 109.49 103.96) \
+                (xy 109.49 108.97) (xy 103.42 108.97) (xy 103.42 82.55) (xy 109.494528 82.55) \
+                (xy 109.494528 86.96) (xy 116.48 86.96) (xy 116.48 78.96) (xy 154.48 78.96) \
+             ) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_single_arc_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 0 0) (end 10 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_arc (start 0 0) (mid 5 -5) (end 10 0) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_single_circle_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_circle (center 50 50) (end 53 54) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_single_curve_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_curve (pts (xy 30 50) (xy 32 48) (xy 35 47) (xy 38 50)) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_two_boundary_elements_is_unproven() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_rect (start 0 0) (end 50 50) (layer \"Edge.Cuts\"))\n\
+             \t(gr_rect (start 60 60) (end 100 100) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert!(matches!(
+            board_outline_shape(&tree),
+            OutlineShape::Unproven { .. }
+        ));
+    }
+
+    #[test]
+    fn outline_shape_malformed_is_missing() {
+        let tree = parse_sexp(
+            "(kicad_pcb\n\
+             \t(gr_line (start 0 0) (end 10 0) (layer \"Edge.Cuts\"))\n\
+             \t(gr_line (start 0 0) (layer \"Edge.Cuts\"))\n\
+             )",
+        )
+        .unwrap();
+        assert_eq!(board_outline_shape(&tree), OutlineShape::Missing);
+    }
+
+    #[test]
+    fn outline_shape_is_missing_without_edge_cuts() {
+        let tree = parse_sexp("(kicad_pcb\n\t(version 20260206)\n)").unwrap();
+        assert_eq!(board_outline_shape(&tree), OutlineShape::Missing);
+    }
+
     // ─── Courtyards ──────────────────────────────────────────────────────
 
     fn assert_bbox_close(got: (f64, f64, f64, f64), want: (f64, f64, f64, f64), label: &str) {
@@ -1560,5 +2088,157 @@ mod tests {
         assert_eq!(ix.skipped_pads(), 2);
         assert_eq!(ix.pads_of_net("N").len(), 1);
         assert_eq!(ix.pads_of_net("N")[0].reference, "U1");
+    }
+
+    /// A board with the two ownership cases side by side: a top-level
+    /// `Edge.Cuts` outline segment, and a footprint carrying its own
+    /// `Edge.Cuts` circle plus a pad.
+    const OWNERSHIP_BOARD: &str = "(kicad_pcb\n\
+        \t(version 20260206)\n\
+        \t(generator \"pcbnew\")\n\
+        \t(footprint \"Conn:PinSocket_1x04\"\n\
+        \t\t(layer \"F.Cu\")\n\
+        \t\t(uuid \"fp-j1\")\n\
+        \t\t(at 140 93.375)\n\
+        \t\t(property \"Reference\" \"J1\"\n\t\t\t(uuid \"prop-ref\")\n\t\t)\n\
+        \t\t(fp_circle\n\t\t\t(center 0 -3.81)\n\t\t\t(end 0.5 -3.81)\n\
+        \t\t\t(layer \"Edge.Cuts\")\n\t\t\t(uuid \"peg-hole\")\n\t\t)\n\
+        \t\t(pad \"1\" smd rect\n\t\t\t(at -1.49 -3.81 90)\n\
+        \t\t\t(layers \"F.Cu\" \"F.Mask\" \"F.Paste\")\n\t\t\t(uuid \"pad-1\")\n\t\t)\n\
+        \t)\n\
+        \t(gr_line\n\t\t(start 120 56.5)\n\t\t(end 160 56.5)\n\
+        \t\t(layer \"Edge.Cuts\")\n\t\t(uuid \"outline-top\")\n\t)\n\
+        \t(gr_line\n\t\t(start 125 60)\n\t\t(end 135 60)\n\
+        \t\t(layer \"F.SilkS\")\n\t\t(uuid \"silk-note\")\n\t)\n\
+        )";
+
+    /// The board's own outline and an unrelated board graphic are top-level
+    /// children of `(kicad_pcb …)`, so both are board-owned — and the layer
+    /// they are drawn on has nothing to do with it.
+    #[test]
+    fn top_level_items_are_board_owned() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+
+        assert_eq!(
+            index.get("outline-top"),
+            Some(&UuidIndexEntry::Unique(ItemIdentity {
+                item_kind: "gr_line".to_string(),
+                layer: Some("Edge.Cuts".to_string()),
+                owner: ItemOwner::Board,
+            }))
+        );
+        assert_eq!(
+            index.get("silk-note"),
+            Some(&UuidIndexEntry::Unique(ItemIdentity {
+                item_kind: "gr_line".to_string(),
+                layer: Some("F.SilkS".to_string()),
+                owner: ItemOwner::Board,
+            }))
+        );
+    }
+
+    /// The whole point of #413: an `Edge.Cuts` circle nested in J1 is
+    /// indistinguishable from the board outline by layer, by node shape, and by
+    /// KiCad's prose. Only its position in the tree tells them apart.
+    #[test]
+    fn footprint_children_name_their_footprint() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+
+        let owner = ItemOwner::Footprint {
+            reference: Some("J1".to_string()),
+            uuid: Some("fp-j1".to_string()),
+        };
+        assert_eq!(
+            index.get("peg-hole"),
+            Some(&UuidIndexEntry::Unique(ItemIdentity {
+                item_kind: "fp_circle".to_string(),
+                layer: Some("Edge.Cuts".to_string()),
+                owner: owner.clone(),
+            }))
+        );
+        // A pad spells `(layers …)`, not `(layer …)`; naming one of its three
+        // would be a guess, so the layer stays unset while ownership does not.
+        assert_eq!(
+            index.get("pad-1"),
+            Some(&UuidIndexEntry::Unique(ItemIdentity {
+                item_kind: "pad".to_string(),
+                layer: None,
+                owner: owner.clone(),
+            }))
+        );
+        // Properties are footprint children too — the index is by depth, not
+        // by a list of interesting node names.
+        assert_eq!(
+            index.get("prop-ref"),
+            Some(&UuidIndexEntry::Unique(ItemIdentity {
+                item_kind: "property".to_string(),
+                layer: None,
+                owner,
+            }))
+        );
+    }
+
+    /// A `(footprint …)` node is itself a top-level board item. Indexing it as
+    /// footprint-owned would make it its own owner, which is not a statement
+    /// about where it sits.
+    #[test]
+    fn the_footprint_node_itself_is_a_board_item() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+
+        assert_eq!(
+            index.get("fp-j1"),
+            Some(&UuidIndexEntry::Unique(ItemIdentity {
+                item_kind: "footprint".to_string(),
+                layer: Some("F.Cu".to_string()),
+                owner: ItemOwner::Board,
+            }))
+        );
+    }
+
+    /// A UUID the board does not carry has no entry. Returning a board-owned
+    /// default would be the exact wrong answer for the case #413 is about.
+    #[test]
+    fn an_unknown_uuid_has_no_entry() {
+        let tree = parse_sexp(OWNERSHIP_BOARD).unwrap();
+        let index = uuid_index(&tree);
+        assert!(!index.contains_key("ffffffff-ffff-4fff-8fff-ffffffffffff"));
+    }
+
+    #[test]
+    fn a_duplicate_uuid_is_ambiguous_regardless_of_file_order() {
+        let source = OWNERSHIP_BOARD.replace("outline-top", "peg-hole");
+        let tree = parse_sexp(&source).unwrap();
+        let index = uuid_index(&tree);
+
+        assert_eq!(index.get("peg-hole"), Some(&UuidIndexEntry::Ambiguous));
+    }
+
+    /// `owner` serialises as the maintainer specified in #413: a `kind`
+    /// discriminant, with the footprint's reference and UUID beside it.
+    #[test]
+    fn owner_serialises_with_a_kind_discriminant() {
+        assert_eq!(
+            serde_json::to_value(ItemOwner::Board).unwrap(),
+            serde_json::json!({ "kind": "board" })
+        );
+        assert_eq!(
+            serde_json::to_value(ItemOwner::Footprint {
+                reference: Some("J1".to_string()),
+                uuid: Some("fp-j1".to_string()),
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "footprint", "reference": "J1", "uuid": "fp-j1" })
+        );
+        assert_eq!(
+            serde_json::to_value(ItemOwner::Footprint {
+                reference: None,
+                uuid: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "footprint" })
+        );
     }
 }

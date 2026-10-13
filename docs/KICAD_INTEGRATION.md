@@ -19,8 +19,18 @@ conflict rather than an overwrite.
 ## KiCad IPC
 
 `crates/konnect-ipc` sends typed protobuf requests over NNG. The socket comes
-from `ipc_address` or `KICAD_API_SOCKET`; KiCad-provided credentials such as
+from `ipc_address`, then `KICAD_API_SOCKET`, then discovery of KiCad's default
+endpoint by `konnect-ipc/src/socket.rs`; KiCad-provided credentials such as
 `KICAD_API_TOKEN` are carried in the IPC client request metadata.
+
+Discovery is per-platform because the endpoint is: a Unix socket is a
+filesystem entry whose metadata is read and whose owner must be this user,
+while NNG's `ipc://` on Windows is a named pipe with no filesystem presence, so
+the candidate path is looked up in the pipe namespace instead. Neither branch
+opens the endpoint — a stream connect that does not complete NNG's handshake
+wedges KiCad's server for every client (#498), and on Windows opening the pipe
+would also consume a server instance. Liveness stays the job of the bounded
+`Ping` in `client.rs`.
 
 The three board-write gates are:
 
@@ -35,6 +45,73 @@ The three board-write gates are:
 Closed-board move, rotate, and flip in `tools/pcb_components.rs` are narrowly
 scoped exceptions with explicit geometry checks. They are not a general license
 to edit a live board file.
+
+`flip_component` on an *open* board no longer falls into that closed-board
+exception: KiCad 10.0.6 added a native `FlipItems` IPC command, so
+`handle_flip_component` drives it through `attempt_ipc_write` like the other
+live-preferred-with-fallback tools, using the same `FlipItems`-transform KiCad's
+own **F** key applies (including the footprint's 3D-model offset/rotation).
+Older or unsupported KiCad answers `AS_UNHANDLED`, which is reported as a
+structured `unsupported_capability` result rather than falling back to editing
+the file — the file fallback only ever fires when no live KiCad holds the named
+board at all. The closed-board file-fallback path is unchanged and keeps
+refusing any footprint whose 3D model has a non-zero `offset.y`/`rotate.x`/
+`rotate.y`, since reproducing KiCad's own 3D-model flip math for that path
+remains out of scope (issue #604).
+
+### Editor observation
+
+`konnect-ipc::KiCadIpcClient::observe_editor_state` queries the running KiCad
+version and schematic/PCB `GetOpenDocuments` surfaces on the configured
+endpoint. `tools/editor_navigation.rs` exposes that typed observation through
+the provisional `editor_navigation` toolset while design issue #395 is under
+review.
+
+The observation preserves project and `DocumentSpecifier` sheet/board identity
+and labels its evidence as live IPC. KiCad 10 has no stable typed query for the
+foreground frame, active document, or active schematic sheet, so those fields
+remain unavailable; Konnect does not infer active state from open-document
+order. The same capability record reports stable typed activation and reveal
+as unsupported rather than routing callers through arbitrary `RunAction`
+strings.
+
+`KiCadIpcClient::observe_selection` accepts one exact editor/document identity
+from that observation, matches it before issuing `GetSelection`, and repeats
+the open-document read afterward because KiCad's `SelectionResponse` carries
+no response header. Every returned item is dispatched by its full protobuf
+type URL and must contain a non-empty KIID; an unknown or malformed selected
+item fails the entire observation rather than being dropped. The vendored
+schematic protobuf currently decodes line and label selections. Schematic
+symbols and other unmodelled types remain explicitly unsupported until KiCad
+provides stable typed serialization for them.
+
+Navigation target resolution keeps two evidence channels in the same result
+without merging them. `GetOpenDocuments` proves that the exact requested live
+project/document/sheet context is still addressable; the saved `.kicad_sch` or
+`.kicad_pcb` structure proves object KIID and human-reference identity. Stable
+KIID lookup is primary. A reference such as `C10` is accepted only when one
+object matches in the exact document and sheet instance; duplicates return
+structured candidates, and stale project ownership or symbol-instance paths
+fail closed before any editor mutation.
+
+Selection mutation uses KiCad's typed `ClearSelection`, `AddToSelection`, and
+`RemoveFromSelection` commands only after every non-clear KIID resolves in the
+explicit saved project/document/sheet. The transport response is not treated
+as success: Konnect performs a fresh exact-context `GetSelection`, compares the
+entire observed set with the expected before/after transition, and returns a
+structured `readback_mismatch` if KiCad did not make precisely that change.
+Duplicate or empty KIID requests are rejected before IPC.
+
+`resolve_cross_probe_target` maps an exact schematic symbol to its PCB
+footprint, or the footprint back to the symbol, from KiCad's saved footprint
+symbol-path linkage. It requires the explicit project, both saved documents,
+the schematic hierarchy instance, and the source KIID; reference agreement is
+checked as an additional consistency guard. Both requested editor documents
+must also be proven open through typed `GetOpenDocuments` readback. Missing,
+duplicate, malformed, or instance-inconsistent links return a structured
+`unresolved_cross_probe_destination` instead of guessing. The operation is
+resolve-only: it does not activate an editor or mutate selection, and pin/pad/
+net expansion remains unsupported until one stable destination can be proven.
 
 ## Schematic-To-Board Sync
 
@@ -58,7 +135,13 @@ ad-hoc command lines.
 The DRC result model preserves design-rule violations, unconnected items, and
 schematic parity. `verification.rs`, `pcb_export.rs`, `design_review.rs`, and
 `manufacturing.rs` consume that complete result; unavailable categories or a
-failed CLI run cannot be treated as a clean board.
+failed CLI run cannot be treated as a clean board. Parity is opt-in on the
+kicad-cli side (`--schematic-parity`), so `run_drc` always requests it; and
+because KiCad writes an empty parity array — while stating on stderr that it
+failed to fetch the schematic netlist — when the board's project has no root
+schematic, `run_drc` reads that statement and reports the category as
+unchecked, with a diagnostic naming the root it would have read, rather than
+as zero. A non-empty parity array is kept as KiCad's evidence regardless.
 
 Konnect's Freerouting bridge keeps the KiCad and routing responsibilities
 separate: `export_specctra_dsn` snapshots the live board and writes a
@@ -129,6 +212,13 @@ list above is not consulted, and `get_installation_info` reports
 `kicad_binary`, `ipc_address`, `transport`, `http_address`, `jlcpcb_db_path`,
 `log_level`, `auto_load_toolsets`, and `eager_toolsets`. The legacy
 `ipc_socket_path` alias is accepted by the serde definition in `config.rs`.
+
+A blank or whitespace-only configured `jlcpcb_db_path` means unset for all
+JLCPCB database tools. They use the platform default (`%APPDATA%/konnect/jlcpcb.db`
+on Windows, `$HOME/.konnect/jlcpcb.db` elsewhere) unless a nonblank configured
+path is supplied. Nonblank configured paths are preserved without trimming;
+the download tool's per-call `output_path` takes precedence. This normalization does not rewrite
+your settings file or download a database at startup.
 
 ## Plugin, Viewer, And Packaging
 

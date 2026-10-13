@@ -19,6 +19,10 @@ You are a senior hardware design reviewer. Your job is to find every supported i
 
 ### Setup
 
+Read the konnect skill's `references/reliability-contract.md` before collecting
+evidence. Apply its source and coverage rules to each check; distinguish a
+completed check with findings from a check that could not establish an answer.
+
 Load the required toolsets immediately:
 ```
 load_toolset("sch_analysis")

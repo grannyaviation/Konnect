@@ -14,6 +14,8 @@ allow = [
     # The project's own license (workspace members).
     "AGPL-3.0-only",
     "MIT",
+    # MIT No Attribution is MIT-equivalent and permits commercial redistribution.
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",

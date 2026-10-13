@@ -151,15 +151,24 @@ connect_to_net(schematic, reference, pin_number, net)
 - Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
   from the symbol body on its own, instead of the label text running back
   across the pin names. Override with `direction` only to fix a layout clash.
-- `batch_connect_to_net` does the same for many pins in one read/write, and
-  places its labels directly on the pin endpoints without stubs.
+- `batch_connect_to_net` does the same for many pins in one read/write. By
+  default it places its labels directly on the pin endpoints without stubs;
+  pass `stub_length`, `direction` and `label_type` for `connect_to_net`'s
+  layout on every pin in the call.
 - Placing a label by hand with `add_schematic_net_label` instead? Take its
   rotation from `orientation_degrees` in `get_schematic_pin_locations`, or the
   text reads back across the symbol's pin names.
+- These labels are sheet-local. In a sheet placed more than once, each instance
+  gets its own independent copy of the net — right for per-instance signals,
+  wrong for a rail every instance must share. A shared rail takes
+  `add_power_symbol` or `add_schematic_net_label` with
+  `label_type: global_label`; both are one net across all sheets and instances.
 
 ### add_power_symbol
 
 Use for all power connections, in preference to labelling a pin with the rail name.
+The one exception is a rail that must stay separate per instance of a repeated
+sheet — see below.
 
 ```
 add_power_symbol(schematic, power_net, x, y, rotation?)
@@ -168,6 +177,9 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
 - Takes coordinates, not a reference and pin number. Place it on the pin
   endpoint (from `get_schematic_pin_locations`) — a power symbol carries its
   pin at its own origin, so the two coinciding is the connection.
+- The position is snapped to the 1.27mm grid, like every other placer, and
+  the response reports where the symbol landed. Pin endpoints of placed
+  components are already on that grid, so a pin endpoint is kept as given.
 - `power_net` is loaded as `power:<power_net>`, so it must name a symbol in
   KiCad's power library: `+3V3` and `+12V`, never `3V3` or `12V`. A miss is an
   error and nothing is placed.
@@ -175,6 +187,11 @@ add_power_symbol(schematic, power_net, x, y, rotation?)
 - A power pin landing mid-segment on a wire gets its junction dot
   automatically, in either order: symbol onto an existing wire, or a wire
   routed across an already-placed symbol.
+- Power symbols are global: every `+5V` symbol on every sheet, and in every
+  instance of a sheet, joins one `+5V` net. A rail that must stay separate per
+  instance of a repeated sheet (each node's own 5V, say) takes a local net
+  label via `connect_to_net` instead — `power:+5V` there shorts all the
+  instances' rails together.
 
 ---
 
@@ -186,6 +203,12 @@ Load `sch_batch` toolset when placing 3 or more components or making bulk connec
 
 Place multiple components in one call. Provide `schematic` and a `components` array of `{lib_id, x, y, rotation?, reference?, value?, unit?}` objects. Pass `reference` explicitly for each component -- it is not auto-assigned.
 
+The batch commits all symbols once, then reconciles every new pin endpoint in
+that same atomic write. Check the "junctions_added_count" and
+"junctions_pruned_count" response fields; a pin placed mid-segment on an
+existing wire is not electrically connected in KiCad unless the required
+junction was added.
+
 ### batch_connect_to_net
 
 Connect multiple pins to the same net in one call. Ideal for:
@@ -196,6 +219,12 @@ Connect multiple pins to the same net in one call. Ideal for:
 ### batch_edit_schematic_components
 
 Bulk-modify component properties (values, footprints, fields) across multiple components.
+The default remains update-only. Set `create_missing: true` to create a missing
+custom field on every placed unit of each named component. `Reference`, `Value`,
+`Footprint` and `Datasheet` are never created through this option; use the
+dedicated arguments or workflows for built-in fields. Inspect each result's
+“updated_units” and “created_units” counts, because a partially populated
+multi-unit component can report both.
 
 ### When to Use Batch vs Individual
 
@@ -232,7 +261,7 @@ Crystal (Device:Crystal) between XI and XO pins. Two load capacitors from each c
 After placing components and wiring, always run these checks:
 
 ### annotate_schematic
-Assigns reference designators (R1, C1, U1, etc.) to all unannotated components. Run after all placement is complete.
+Numbers `?` designators the way eeschema's Tools → Annotate does (ascending X, first free number in the project, numbers reserved across every sheet instance in the file) and writes both places a designator lives. The units of one multi-unit part get one shared designator. Duplicated designators are **reported, not fixed**: read `unresolved` and the `outcome` — `partial` means the schematic still has a conflict — and pass `resolve_duplicates: true` to renumber all but the first of each group of separate parts; a shared designator that could be the units of one package is never renumbered, so fix those by hand. It annotates one project's instance records (the schematic's owner, or `project`) and never edits another project's; numbers used on the project's other sheets are reserved through its sheet tree (the response lists the sheets it consulted), but duplicates already spread across sheets are not detected, so annotate each sheet and then run `run_erc`. Run after all placement is complete; `dry_run: true` shows the plan first.
 
 ### validate_wire_connections
 Checks that all wires connect properly to pins. Reports:
@@ -303,7 +332,7 @@ production-ready claim.
 3. **Always verify after changes** — run validation tools after placing and wiring
 4. **Use the grid** — all placements on 1.27mm grid
 5. **Search before placing** — use `search_symbols` to confirm lib_id exists
-6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels
+6. **Power symbols for power** — use `add_power_symbol` for rails, not net labels; the exception is a rail that must stay separate per instance of a repeated sheet, which takes a local label because power symbols are global
 7. **Net labels for named signals** — keeps schematics readable
 8. **Save frequently** — call `save_project` after major operations
 9. **Load toolsets first** — check `get_active_toolsets()` and load what you need before starting

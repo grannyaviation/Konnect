@@ -5,6 +5,8 @@
 
 use super::ToolsetMeta;
 use crate::tools::ToolDef;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Toolsets auto-loaded when the server starts.
 ///
@@ -25,10 +27,16 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         tool_count: 7,
     },
     ToolsetMeta {
+        name: "editor_navigation",
+        description: "Observe and semantically navigate exact KiCad editor, document, sheet, selection, and cross-probe context",
+        category: "project",
+        tool_count: 5,
+    },
+    ToolsetMeta {
         name: "sch_components",
-        description: "Add, edit, move, rotate, and delete schematic symbols, and set the page size",
+        description: "Add, edit, move, rotate, and delete schematic symbols",
         category: "schematic",
-        tool_count: 20,
+        tool_count: 18,
     },
     ToolsetMeta {
         name: "sch_wiring",
@@ -62,21 +70,21 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
     ToolsetMeta {
         name: "sch_hierarchy",
-        description: "Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
+        description: "Sheet files and hierarchical sheets: create a schematic file and set its page size, add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation",
         category: "schematic",
-        tool_count: 12,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 12,
+        tool_count: 13,
     },
     ToolsetMeta {
         name: "pcb_components",
         description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 19,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "pcb_routing",
@@ -140,11 +148,32 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
     },
 ];
 
-/// Return the ToolDefs for a given toolset name, or None if unknown.
+static TOOL_CATALOGUE: OnceLock<HashMap<&'static str, Vec<ToolDef>>> = OnceLock::new();
+
+fn tool_catalogue() -> &'static HashMap<&'static str, Vec<ToolDef>> {
+    TOOL_CATALOGUE.get_or_init(|| {
+        ALL_TOOLSETS
+            .iter()
+            .map(|toolset| {
+                let tools = build_tools_for(toolset.name)
+                    .unwrap_or_else(|| panic!("no tool builder for '{}'", toolset.name));
+                (toolset.name, tools)
+            })
+            .collect()
+    })
+}
+
+/// Return cached ToolDefs for a given toolset name, or None if unknown.
+/// Clones share each definition's compiled input validator through `Arc`.
 pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
+    tool_catalogue().get(name).cloned()
+}
+
+fn build_tools_for(name: &str) -> Option<Vec<ToolDef>> {
     use crate::tools::*;
     match name {
         "project" => Some(project::tools()),
+        "editor_navigation" => Some(editor_navigation::tools()),
         "sch_components" => Some(sch_components::tools()),
         "sch_wiring" => Some(sch_wiring::tools()),
         "sch_bus" => Some(sch_bus::tools()),

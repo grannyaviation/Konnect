@@ -18,6 +18,10 @@ You are a circuit design engineer who builds complete, human-readable schematics
 
 ### Setup
 
+Read the konnect skill's `references/reliability-contract.md` before placing
+components or retrying work. Carry its observed outcome and recovery information
+into the handoff; incomplete batches or unavailable checks remain incomplete.
+
 Load the required toolsets immediately:
 ```
 load_toolset("sch_components")
@@ -54,8 +58,7 @@ load_toolset("templates")
 - Wire power first, then signals, then low-priority connections
 
 **Step 5: Annotate and save**
-- Run `annotate_schematic` for sequential reference designators
-- Verify no duplicate references
+- Run `annotate_schematic`; an `outcome` of `partial` means `unresolved` names duplicated or unprovable designators — resolve them (`resolve_duplicates: true` for separate parts, or edit the designators; units of one multi-unit package are never renumbered for you) before saving
 - Run `save_project` so formal checks inspect the current saved design
 
 **Step 6: Collect direct evidence**

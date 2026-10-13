@@ -20,7 +20,7 @@ Load the required toolsets for design review:
 
 ```
 load_toolset('sch_analysis')     # find_orphan_items, find_shorted_nets, find_single_pin_nets
-load_toolset('verification')     # run_drc, check_clearance, get_design_rules
+load_toolset('verification')     # run_drc; check_clearance anchor/courtyard spacing; rules
 load_toolset('sch_export')       # run_erc
 load_toolset('pcb_export')       # get_drc_violations
 load_toolset('manufacturing')    # validate_for_manufacturing
@@ -49,6 +49,14 @@ Judge findings in this order:
 A weaker finding may ask a question; it does not override stronger contradictory
 evidence. Any required check that did not run, returned impossible coverage, or
 remains inconsistent with stronger evidence makes the verdict `INCOMPLETE`.
+
+DRC violation items carry `owner` and `ownership_status`. That is direct
+evidence, not a heuristic: `owner.kind: "footprint"` means the offending
+geometry belongs to `owner.reference`'s own artwork, so the remedy is a
+footprint or rule change rather than a placement change — the finding itself
+stands either way. When `ownership_status` is not `"resolved"`, ownership is
+unknown and `owner` is `null`; corroborate with
+`list_board_footprint_graphics` rather than assuming the board owns it.
 
 ## References by review branch
 

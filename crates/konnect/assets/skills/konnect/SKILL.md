@@ -38,6 +38,12 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 
 ## Standard Workflow
 
+Before a mutation, a dependent check, a retry, or a completion claim, read
+[the reliability contract](references/reliability-contract.md), starting with
+"For callers: establish what happened". Apply its outcome, source, coverage and
+recovery rules to the fields this installed server actually returns. Guidance
+does not establish that a missing server-side check ran.
+
 1. **Identify the project** — locate the `.kicad_pro` file
 2. **Classify the task** — read-only (Channel 2 or 3) or write (Channel 1)
 3. **Verify MCP is connected** — call `list_toolboxes` to confirm tools are available
@@ -54,7 +60,7 @@ Only to answer questions not available through exports (sheet hierarchy, title b
 | "What's connected to SCL?" | 2 | `load_toolset("sch_analysis")` then `get_net_connections` |
 | "Add a 100nF cap to U3 VCC" | 1 | `load_toolset("sch_components")` + `load_toolset("sch_wiring")` |
 | "Rename net /CLK to /SYS_CLK" | 1 | Warn about downstream effects, then MCP tools |
-| "Run DRC" | 1 | `load_toolset("verification")` then `run_drc` |
+| "Run DRC" | 1 | `load_toolset("verification")` then `run_drc` — read each item's `owner`/`ownership_status` before advising a fix (board geometry vs. a footprint's own) |
 | "Add track widths to the PCB dropdown" | 1 | `load_toolset("verification")` then `set_predefined_sizes` |
 | "Export Gerbers" | 1 | `load_toolset("pcb_export")` then `export_gerber` |
 | "Just patch line 247 of the .kicad_sch" | REFUSE | Explain risks, offer MCP alternative |

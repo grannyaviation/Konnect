@@ -24,9 +24,14 @@ transport because KiCad may already hold or have changed the target document.
    `crates/konnect-core/src/tools`.
 2. Implement the handler near related handlers and reuse their target checks and
    response conventions.
-3. Use the existing JSON-schema style and list every required field.
-4. Read required values with `require_*` or `get_path`, never with a silent
-   default.
+3. Use valid Draft 2020-12 JSON Schema, list every required field, declare
+   bounds, and set `additionalProperties: false` only when the object is
+   intentionally closed. The catalogue compiles and caches this schema; MCP
+   dispatch enforces exactly what is advertised.
+4. Read required values with `require_*` or `get_path`, and malformed-present
+   options with a checked optional helper. Dispatch validation does not replace
+   direct-handler validation. Never turn a malformed present value into an
+   omitted value or silent default.
 5. Validate the target and all preconditions before the first mutation.
 6. Use `CallToolResult::json`, `text`, `image`, or `error_kind` as appropriate.
 7. Update `router/registry.rs`, `tool-directory.md`, and the guarded documentation

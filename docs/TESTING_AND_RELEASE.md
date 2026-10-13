@@ -49,6 +49,13 @@ tests should prove request construction and failure classification; an ignored
 live test or the end-to-end workflow should prove behavior that depends on a
 running editor.
 
+IPC doubles in `konnect-core` must use the shared `test_support::MockIpcServer`.
+The returned guard owns an already-listening, process-unique `inproc://`
+endpoint and joins its worker when dropped. Retain that guard for the whole
+test. Do not discover a free TCP port by binding it, dropping the listener, and
+then asking NNG to bind the same port: another process can claim the port in
+between, making otherwise deterministic tests fail with `AddressInUse`.
+
 The Specctra import undo boundary has a manual live gate because KiCad IPC can
 create a named commit but cannot invoke the editor's Undo action. Open a
 disposable copy of
@@ -67,9 +74,24 @@ test passes only when the exact pre-import IPC snapshot returns.
 ## CI And Live Validation
 
 `.github/workflows/ci.yml` covers the Rust workspace, formatting, clippy,
-documentation tests, viewer, plugin, Nix, and PCM validation. The live KiCad
-workflow is separate because it requires an installed graphical application and
-is not an ordinary per-PR gate.
+documentation tests, viewer, plugin, Nix, and PCM validation. The real-KiCad
+workflow remains separate because it installs KiCad and is not an ordinary
+per-PR gate. Apply the `run:e2e-kicad` label to run that same workflow for a
+pull request when KiCad-facing behavior needs hosted acceptance evidence.
+
+Before creating a release tag, dispatch `.github/workflows/release.yml` against
+the exact candidate ref. The manual entry point runs the release-profile target
+matrix, all three PCM package builds, and the reusable real-KiCad acceptance
+workflow with a synthetic `0.0.0` package version. Its publication job is
+tag-only, so this pre-tag smoke run cannot create a GitHub release.
+
+On a release tag, `.github/workflows/release.yml` calls
+`.github/workflows/e2e-kicad.yml` as a reusable workflow. The called workflow
+checks out the caller's exact tag commit. The `Create Release` job depends on
+that acceptance job and both artifact-building jobs, so failed real-KiCad
+acceptance leaves the diagnostic build artifacts in the workflow run but cannot
+create a GitHub release or upload a partial release asset set. Weekly and manual
+real-KiCad runs continue to use the standalone workflow entry points.
 
 In the PR description, list every command run and explicitly name checks skipped
 because they require KiCad, another operating system, credentials, or release

@@ -34,7 +34,10 @@ pub const SKILLS: &[SkillManifest] = &[
     SkillManifest {
         name: "konnect",
         content: include_str!("../assets/skills/konnect/SKILL.md"),
-        references: &[],
+        references: &[(
+            "reliability-contract.md",
+            include_str!("../../../docs/RELIABILITY_CONTRACT.md"),
+        )],
     },
     SkillManifest {
         name: "kicad-schematic",

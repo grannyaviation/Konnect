@@ -416,13 +416,17 @@ fn embedded_lib_symbol<'a>(schematic: &'a Schematic, lib_id: &str) -> Option<&'a
         .find(|s| s.value() == Some(lib_id))
 }
 
-/// Library-owned fields that KiCad copies onto each placed symbol instance.
+/// Library-owned fields that a placement must copy onto the symbol instance.
 ///
 /// Read these from the embedded definition rather than resolving the library
 /// again: the embedded copy is already flattened for derived symbols and is
 /// the exact definition the schematic instance refers to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymbolMetadata {
+    /// The reference prefix, such as `R` or `#FLG`.
+    pub reference: String,
+    pub value: String,
+    pub footprint: String,
     pub datasheet: String,
     pub description: String,
 }
@@ -445,6 +449,9 @@ pub fn symbol_metadata(schematic: &Schematic, lib_id: &str) -> SymbolMetadata {
             .to_string()
     };
     SymbolMetadata {
+        reference: value("Reference"),
+        value: value("Value"),
+        footprint: value("Footprint"),
         datasheet: value("Datasheet"),
         description: value("Description"),
     }
@@ -727,7 +734,7 @@ mod suggestion_tests {
         std::fs::create_dir_all(&symdir).unwrap();
         std::fs::write(
             symdir.join("LM2904.kicad_sym"),
-            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"LM2904\"\n\t\t(pin_names (offset 0.127))\n\t\t(in_bom yes)\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"LM2904\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"lm2904.pdf\" (at 0 0 0))\n\t\t(symbol \"LM2904_1_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t\t(symbol \"LM2904_2_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"7\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
+            "(kicad_symbol_lib\n\t(version 20241209)\n\t(generator \"test\")\n\t(symbol \"LM2904\"\n\t\t(pin_names (offset 0.127))\n\t\t(in_bom yes)\n\t\t(property \"Reference\" \"U\" (at 0 0 0))\n\t\t(property \"Value\" \"LM2904\" (at 0 0 0))\n\t\t(property \"Footprint\" \"Package_DIP:DIP-8_W7.62mm\" (at 0 0 0))\n\t\t(property \"Datasheet\" \"lm2904.pdf\" (at 0 0 0))\n\t\t(symbol \"LM2904_1_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"1\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t\t(symbol \"LM2904_2_1\"\n\t\t\t(pin output line (at 7.62 0 180) (length 2.54)\n\t\t\t\t(name \"~\" (effects (font (size 1.27 1.27))))\n\t\t\t\t(number \"7\" (effects (font (size 1.27 1.27))))\n\t\t\t)\n\t\t)\n\t)\n)\n",
         )
         .unwrap();
         std::fs::write(
@@ -776,9 +783,14 @@ mod suggestion_tests {
             out.contains("lm2904.pdf"),
             "properties the child lacks are inherited:\n{out}"
         );
+        let metadata = symbol_metadata(&sch, "Amp:NE5532");
+        assert_eq!(metadata.value, "NE5532", "the child's own Value wins");
         assert_eq!(
-            symbol_metadata(&sch, "Amp:NE5532").datasheet,
-            "lm2904.pdf",
+            metadata.footprint, "Package_DIP:DIP-8_W7.62mm",
+            "a field absent from the child is inherited from the parent"
+        );
+        assert_eq!(
+            metadata.datasheet, "lm2904.pdf",
             "placed-instance metadata must follow the flattened definition"
         );
         // Pins from both units present exactly once.
@@ -957,11 +969,14 @@ mod field_anchor_tests {
     #[test]
     fn reads_instance_metadata_from_direct_library_properties_only() {
         let (sch, _dir) = schematic_with(
-            "(symbol \"Device:R\" (property \"Datasheet\" \"~\" (at 0 0 0)) (property \"Description\" \"Resistor\" (at 0 0 0)) (symbol \"R_0_1\" (property \"Description\" \"nested\" (at 0 0 0))))",
+            "(symbol \"Device:R\" (property \"Reference\" \"R\" (at 0 0 0)) (property \"Value\" \"R\" (at 0 0 0)) (property \"Footprint\" \"Resistor_THT:R_Axial\" (at 0 0 0)) (property \"Datasheet\" \"~\" (at 0 0 0)) (property \"Description\" \"Resistor\" (at 0 0 0)) (symbol \"R_0_1\" (property \"Description\" \"nested\" (at 0 0 0))))",
         );
         assert_eq!(
             symbol_metadata(&sch, "Device:R"),
             SymbolMetadata {
+                reference: "R".to_string(),
+                value: "R".to_string(),
+                footprint: "Resistor_THT:R_Axial".to_string(),
                 datasheet: "~".to_string(),
                 description: "Resistor".to_string(),
             }

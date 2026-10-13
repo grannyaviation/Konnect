@@ -320,6 +320,80 @@ fn place_component_loads_real_library_geometry() {
     }
 }
 
+/// Issue #462 through the public MCP boundary and a real KiCad PCB Editor.
+///
+/// This proves more than a successful tool response: the tool must select IPC,
+/// KiCad must expose the new footprint through live readback, and a KiCad save
+/// must persist the exact shipped library id and NPTH drill geometry.
+#[test]
+#[ignore = "requires a running KiCad GUI, API socket, disposable open board, and standard footprint libraries"]
+fn add_mounting_hole_round_trips_through_live_kicad() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let reference =
+        std::env::var("KONNECT_LIVE_KICAD_HOLE_REFERENCE").unwrap_or_else(|_| "H900".to_string());
+    let expected_lib_id = "MountingHole:MountingHole_3.2mm_M3";
+
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the disposable board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "pcb_board"}));
+    let result = mcp.tool(
+        "add_mounting_hole",
+        json!({
+            "board": board,
+            "x": 42.0,
+            "y": 37.0,
+            "drill_diameter": 3.2,
+            "reference": reference
+        }),
+    );
+    let body: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+        .expect("add_mounting_hole did not return JSON");
+    assert_eq!(body["source"], "ipc", "{body}");
+    assert_eq!(body["reference"], reference, "{body}");
+    assert_eq!(body["footprint"], expected_lib_id, "{body}");
+
+    let live = live_footprint(&ipc, &board, &reference);
+    assert_eq!(
+        live.definition
+            .as_ref()
+            .and_then(|definition| definition.id.as_ref())
+            .map(|id| format!("{}:{}", id.library_nickname, id.entry_name)),
+        Some(expected_lib_id.to_string()),
+        "live KiCad readback did not preserve the shipped library identity"
+    );
+
+    ipc.save_board().expect("failed to save live board");
+    let tree = parse_sexp(&std::fs::read_to_string(&board).unwrap()).unwrap();
+    let saved = footprint(&tree, &reference);
+    assert_eq!(
+        saved.get(1).and_then(SexpNode::as_str),
+        Some(expected_lib_id)
+    );
+    let pad = saved
+        .find_all("pad")
+        .into_iter()
+        .next()
+        .expect("saved mounting hole has no pad");
+    assert_eq!(pad.get(2).and_then(SexpNode::as_str), Some("np_thru_hole"));
+    assert!((pad.find("drill").unwrap().get_f64(1).unwrap() - 3.2).abs() < 1e-6);
+}
+
 #[test]
 #[ignore = "requires a running KiCad GUI, API socket, saved schematic, and matching open board"]
 fn schematic_sync_apply_then_dry_run_is_noop() {
@@ -622,4 +696,147 @@ fn footprint_library_update_apply_then_dry_run_is_noop() {
             }),
         "{drc}"
     );
+}
+
+/// What a real KiCad puts in `DocumentSpecifier`, recorded rather than assumed.
+///
+/// The ambiguity gate in `find_open_board` refuses whenever an open PCB
+/// document cannot be placed on disk, and the shapes it refuses were derived
+/// from the vendored proto's own contract — `board_filename` is documented as
+/// "a PCB with a given filename, e.g. `board.kicad_pcb`", with
+/// `ProjectSpecifier.path` supplying the directory. A gate built on that
+/// reading is only as good as the reading, so this prints every field of every
+/// open document and then asserts the property the gate depends on: a live
+/// KiCad's open-document list is one Konnect can resolve in full.
+///
+/// Run it against a KiCad holding the disposable board:
+///
+/// ```text
+/// KICAD_API_SOCKET=… KONNECT_LIVE_KICAD_BOARD=… \
+///   cargo test -p konnect --test live_kicad_tools -- --ignored --nocapture \
+///   real_kicad_open_documents_resolve_to_comparable_paths
+/// ```
+#[test]
+#[ignore = "requires a running KiCad GUI with a board open and its API socket"]
+fn real_kicad_open_documents_resolve_to_comparable_paths() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let ipc = KiCadIpcClient::new(&socket);
+
+    let documents = ipc.get_open_documents().expect("KiCad answered");
+    assert!(
+        !documents.is_empty(),
+        "open the disposable board in KiCad before running this"
+    );
+    for document in &documents {
+        println!(
+            "open PCB document: type={} identifier={:?} project={:?}",
+            document.r#type, document.identifier, document.project
+        );
+    }
+
+    // The property the gate rests on: against a real KiCad, the requested
+    // board is positively identified rather than refused as ambiguous.
+    ipc.find_open_board(&board)
+        .unwrap_or_else(|error| panic!("KiCad's open-document list was not resolvable: {error:#}"));
+
+    // And a board that is genuinely not open is reported as such, not as an
+    // ambiguity — the distinction that decides whether a file write may run.
+    let absent = board.with_file_name("konnect-not-open-probe.kicad_pcb");
+    let error = ipc
+        .find_open_board(&absent)
+        .expect_err("that board is not open");
+    assert!(
+        matches!(
+            konnect_ipc::IpcFailure::from_error(error),
+            konnect_ipc::IpcFailure::Target {
+                error: konnect_ipc::BoardTargetError::WrongDocument { .. },
+                ..
+            }
+        ),
+        "a complete open-document list must prove absence, not merely fail to confirm it"
+    );
+}
+
+/// `get_board_extents` against a real KiCad (#688): the live answer comes from
+/// KiCad, not silently from the file, and on an unedited board it agrees with
+/// the saved file measured the way KiCad measures it.
+///
+/// The saved read cannot measure text or dimensions, so its box lies inside the
+/// live one, and equals it when nothing went unmeasured.
+#[test]
+#[ignore = "requires a running KiCad GUI with an unedited board open and its API socket"]
+fn board_extents_live_and_saved_agree_on_an_unedited_board() {
+    let board = std::path::PathBuf::from(
+        std::env::var("KONNECT_LIVE_KICAD_BOARD")
+            .expect("KONNECT_LIVE_KICAD_BOARD must name the open board"),
+    );
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let ipc = KiCadIpcClient::new(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match ipc.find_open_board(&board) {
+            Ok(_) => break,
+            Err(error)
+                if error.to_string().contains("AS_NOT_READY")
+                    && std::time::Instant::now() < deadline => {}
+            Err(error) => panic!("KiCad did not open the board: {error:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut mcp = McpProcess::spawn(&socket);
+    mcp.tool("load_toolset", json!({"name": "pcb_board"}));
+    let mut extents = |source: &str| -> Value {
+        let result = mcp.tool(
+            "get_board_extents",
+            json!({"board": board, "board_source": source}),
+        );
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+            .expect("get_board_extents did not return JSON")
+    };
+    let live = extents("live");
+    let saved = extents("saved");
+    println!("live:  {live}\nsaved: {saved}");
+
+    assert_eq!(live["sources"]["bounds"], "ipc", "{live}");
+    assert_eq!(saved["sources"]["bounds"], "saved_board", "{saved}");
+    assert!(
+        live["item_count"].as_u64().unwrap() > 0,
+        "KiCad measured nothing: {live}"
+    );
+    assert_eq!(saved["skipped_item_count"], 0, "{saved}");
+    // KiCad 10 will not list tables or generators. The live answer names both
+    // with KiCad's own refusal instead of reading as complete (#688).
+    let unavailable = live["unavailable_item_classes"]
+        .as_array()
+        .expect("the live answer names what KiCad would not list");
+    for class in ["tables", "generators"] {
+        let named = unavailable
+            .iter()
+            .find(|entry| entry["class"] == class)
+            .unwrap_or_else(|| panic!("{class} is not named: {live}"));
+        assert_eq!(named["reason"], "refused", "{live}");
+        assert_eq!(named["kiapi_status"], "AS_BAD_REQUEST", "{live}");
+    }
+    assert_eq!(saved["unavailable_item_classes"], json!([]), "{saved}");
+
+    let coordinate = |body: &Value, key: &str| body[key].as_f64().unwrap();
+    let tolerance = 1e-4;
+    assert!(coordinate(&saved, "x_min") >= coordinate(&live, "x_min") - tolerance);
+    assert!(coordinate(&saved, "y_min") >= coordinate(&live, "y_min") - tolerance);
+    assert!(coordinate(&saved, "x_max") <= coordinate(&live, "x_max") + tolerance);
+    assert!(coordinate(&saved, "y_max") <= coordinate(&live, "y_max") + tolerance);
+    if saved["unmeasured_item_counts"] == json!({}) {
+        for key in ["x_min", "y_min", "x_max", "y_max"] {
+            let off = (coordinate(&saved, key) - coordinate(&live, key)).abs();
+            assert!(
+                off <= tolerance,
+                "{key} differs by {off} mm\n{live}\n{saved}"
+            );
+        }
+    }
 }

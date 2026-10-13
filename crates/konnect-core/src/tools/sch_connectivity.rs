@@ -22,21 +22,24 @@
 //! KiCad snaps to grid, so exact agreement is the normal case.
 //!
 //! [`ConnectivityIndex`] is built once per tree and holds every item that can
-//! terminate a point — wires, wire endpoints, labels, pins with the reference
-//! that owns them, sheet pins, junctions and no-connects — under a single
-//! tolerance, and the tools express policy over it. One [`seed_net_graph`] is
+//! terminate a point — wires, wire endpoints, verified wire-side bus-entry
+//! corners, labels, pins with the reference that owns them, sheet pins,
+//! junctions and no-connects — under a single tolerance, and the tools express
+//! policy over it. Bus geometry is indexed for attachment decisions but is
+//! intentionally absent from [`NetGraph`]: a bus is a bundle, not one electrical
+//! net. One [`seed_net_graph`] is
 //! the only definition of the graph, so the ten read-only tools that want net
 //! names cannot drift from the three that ask about attachment.
 
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_junctions, extract_no_connects, extract_sheet_pins, pin_endpoint, Label, LabelKind,
-        LibPin, Wire,
+        extract_bus_entries, extract_junctions, extract_no_connects, extract_sheet_pins,
+        pin_endpoint, Label, LabelKind, LibPin, Wire,
     },
     SexpNode,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The coincidence tolerance the connectivity tools have always used, in mm.
 /// `find_orphan_items` takes its own as an argument; the rest use this.
@@ -51,10 +54,17 @@ fn bucket(value: f64, tolerance: f64) -> i64 {
 /// Points bucketed at the coincidence tolerance, so a lookup probes nine cells
 /// instead of scanning every point. `points_coincident` compares an L∞ box of
 /// side `tol`, which the 3×3 neighbourhood covers exactly.
+///
+/// Each point keeps the position it was built at, so a caller holding the slice
+/// the index was built from can recover the item itself and not only its
+/// coordinates — see [`ConnectivityIndex::point_detail`].
 struct PointIndex {
     tol: f64,
-    buckets: HashMap<(i64, i64), Vec<(f64, f64)>>,
+    buckets: HashMap<(i64, i64), Vec<IndexedPoint>>,
 }
+
+/// An indexed point: where it is, and the position it was built at.
+type IndexedPoint = (f64, f64, usize);
 
 impl PointIndex {
     fn build(points: impl IntoIterator<Item = (f64, f64)>, tol: f64) -> Self {
@@ -62,9 +72,9 @@ impl PointIndex {
             tol,
             buckets: HashMap::new(),
         };
-        for (x, y) in points {
+        for (ordinal, (x, y)) in points.into_iter().enumerate() {
             let key = index.cell(x, y);
-            index.buckets.entry(key).or_default().push((x, y));
+            index.buckets.entry(key).or_default().push((x, y, ordinal));
         }
         index
     }
@@ -73,26 +83,27 @@ impl PointIndex {
         ((x / self.tol).floor() as i64, (y / self.tol).floor() as i64)
     }
 
+    /// Every indexed point coinciding with `(x, y)`, as `(x, y, build ordinal)`.
+    /// Yielded in bucket order, which is not build order: two coincident points
+    /// can fall in different cells, so a caller that reports them must sort on
+    /// the ordinal rather than inherit whichever cell was probed first.
+    fn hits_at(&self, x: f64, y: f64) -> impl Iterator<Item = IndexedPoint> + '_ {
+        let (cx, cy) = self.cell(x, y);
+        (-1..=1)
+            .flat_map(move |dx| (-1..=1).map(move |dy| (cx + dx, cy + dy)))
+            .filter_map(move |key| self.buckets.get(&key))
+            .flatten()
+            .copied()
+            .filter(move |(px, py, _)| points_coincident(x, y, *px, *py, self.tol))
+    }
+
     /// How many indexed points coincide with `(x, y)`.
     fn count_at(&self, x: f64, y: f64) -> usize {
-        let (cx, cy) = self.cell(x, y);
-        let mut found = 0;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy)) else {
-                    continue;
-                };
-                found += bucket
-                    .iter()
-                    .filter(|(px, py)| points_coincident(x, y, *px, *py, self.tol))
-                    .count();
-            }
-        }
-        found
+        self.hits_at(x, y).count()
     }
 
     fn contains(&self, x: f64, y: f64) -> bool {
-        self.count_at(x, y) > 0
+        self.hits_at(x, y).next().is_some()
     }
 }
 
@@ -181,24 +192,85 @@ pub(crate) fn pt_key(x: f64, y: f64) -> (i64, i64) {
     ((x * 1000.0).round() as i64, (y * 1000.0).round() as i64)
 }
 
+/// A name a label puts on a point, with the kind of label that put it there.
+///
+/// The kind is what makes [`NetGraph::name_of_root`] deterministic: one net can
+/// carry several names, and which one it is *called* follows KiCad's own
+/// precedence rather than whichever the map happened to yield first.
+#[derive(Clone)]
+struct NetName {
+    name: String,
+    kind: LabelKind,
+}
+
+/// KiCad's net-name precedence, highest first: a global label outranks a power
+/// symbol, which outranks a local label, which outranks a hierarchical one.
+///
+/// Verified against KiCad 10.0.5 by netlisting one net carrying each pair:
+/// `+3V3` power symbol with a `LOCAL_VCC` label nets as `+3V3`, either with a
+/// `GLOBAL_SYS` global label nets as `GLOBAL_SYS`, and a local label beats a
+/// hierarchical one. It is `CONNECTION_SUBGRAPH`'s driver priority, minus the
+/// sheet-pin and pin ranks below it — neither names a net here.
+fn driver_priority(kind: LabelKind) -> u8 {
+    match kind {
+        LabelKind::GlobalLabel => 3,
+        LabelKind::PowerSymbol => 2,
+        LabelKind::NetLabel => 1,
+        LabelKind::HierarchicalLabel => 0,
+    }
+}
+
+/// Whether `a` names the net in preference to `b`. Equal priority is broken on
+/// the name, ascending, which is KiCad's own tie-break (two local labels on one
+/// net gave `AAA` over `LOCAL_VCC`, and `LOCAL_VCC` over `ZZZ`).
+fn names_ahead_of(a: &NetName, b: &NetName) -> bool {
+    let (pa, pb) = (driver_priority(a.kind), driver_priority(b.kind));
+    pa > pb || (pa == pb && a.name < b.name)
+}
+
+/// A net's identity: the union-find root every point on that net resolves to.
+///
+/// Distinct from a net *name*, which a net may have several of or none at all.
+pub(crate) type NetRoot = (i64, i64);
+
+/// A graph of points joined into nets, and the name each net carries.
+///
+/// Built only by [`seed_net_graph`], which is why every mutator below is
+/// private: once seeding calls [`NetGraph::name_nets`] the graph is frozen, and
+/// `root_names` cannot go stale behind a later union. Callers get the two
+/// questions they actually ask — [`root_at`](Self::root_at) for a net's
+/// identity, [`name_of_root`](Self::name_of_root) for what it is called.
 pub(crate) struct NetGraph {
-    pub(crate) point_nets: HashMap<(i64, i64), String>,
-    pub(crate) parent: HashMap<(i64, i64), (i64, i64)>,
+    /// Every name at a point, not just the winning one. A rail label written
+    /// over the power symbol that names it puts two names on one coordinate,
+    /// and dropping the loser would keep it out of
+    /// [`merge_named_nets`](Self::merge_named_nets) — so a point carrying
+    /// `AAA` and `ZZZ` would never join a disconnected `ZZZ` segment.
+    point_nets: HashMap<(i64, i64), Vec<NetName>>,
+    parent: HashMap<(i64, i64), NetRoot>,
+    /// The winning name per root, resolved once at the end of seeding.
+    root_names: HashMap<NetRoot, String>,
+    /// Every name on each root, sorted. A caller classifying a net — is this a
+    /// rail? is it ground? — must read all of them: the winning name can be a
+    /// global label that says nothing about the `+3V3` alias beside it.
+    root_aliases: HashMap<NetRoot, BTreeSet<String>>,
 }
 
 impl NetGraph {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         NetGraph {
             point_nets: HashMap::new(),
             parent: HashMap::new(),
+            root_names: HashMap::new(),
+            root_aliases: HashMap::new(),
         }
     }
 
-    pub(crate) fn ensure(&mut self, k: (i64, i64)) {
+    fn ensure(&mut self, k: (i64, i64)) {
         self.parent.entry(k).or_insert(k);
     }
 
-    pub(crate) fn find(&mut self, k: (i64, i64)) -> (i64, i64) {
+    fn find(&mut self, k: (i64, i64)) -> NetRoot {
         self.ensure(k);
         let p = self.parent[&k];
         if p == k {
@@ -209,7 +281,7 @@ impl NetGraph {
         root
     }
 
-    pub(crate) fn union(&mut self, a: (i64, i64), b: (i64, i64)) {
+    fn union(&mut self, a: (i64, i64), b: (i64, i64)) {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra != rb {
@@ -217,7 +289,7 @@ impl NetGraph {
         }
     }
 
-    pub(crate) fn add_wire(&mut self, w: &Wire) {
+    fn add_wire(&mut self, w: &Wire) {
         let a = pt_key(w.x1, w.y1);
         let b = pt_key(w.x2, w.y2);
         self.ensure(a);
@@ -225,23 +297,124 @@ impl NetGraph {
         self.union(a, b);
     }
 
-    pub(crate) fn add_label(&mut self, x: f64, y: f64, net: &str) {
+    fn add_label(&mut self, x: f64, y: f64, net: &str, kind: LabelKind) {
         let k = pt_key(x, y);
         self.ensure(k);
-        self.point_nets.insert(k, net.to_string());
+        let held = self.point_nets.entry(k).or_default();
+        // Kept whole, and ranked only when a name has to be *chosen*: every
+        // name at this point still has to reach `merge_named_nets`, or a net
+        // joined to this one by the losing name would stay a net of its own.
+        if !held.iter().any(|name| name.name == net) {
+            held.push(NetName {
+                name: net.to_string(),
+                kind,
+            });
+        }
     }
 
-    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
-        let k = pt_key(x, y);
-        self.ensure(k);
-        let root = self.find(k);
-        let labels: Vec<_> = self.point_nets.clone().into_iter().collect();
-        for (lk, net) in labels {
-            if self.find(lk) == root {
-                return Some(net);
+    /// The graph node a point belongs to. Two points share a root exactly when
+    /// they are on one net — through wire and junction geometry, and through
+    /// [`merge_named_nets`](Self::merge_named_nets) for the pieces KiCad joins
+    /// by name alone.
+    ///
+    /// This is the comparison a caller wants wherever it would otherwise
+    /// compare net *names*: a net carrying two names has one root and would
+    /// fail a name comparison against itself.
+    pub(crate) fn root_at(&mut self, x: f64, y: f64) -> NetRoot {
+        self.find(pt_key(x, y))
+    }
+
+    /// What the net at `root` is called, or `None` when no label names it.
+    ///
+    /// A net can carry more than one name — a rail named by a `+3V3` power
+    /// symbol that also has a label on it, a local label on a net that also
+    /// carries a global one. The answer is the one KiCad's netlister would
+    /// choose (see [`driver_priority`]), not whichever the map yielded first:
+    /// that was `HashMap` iteration order, so the name moved between runs of
+    /// the same binary and the audits reported the losing name as a rail of its
+    /// own.
+    pub(crate) fn name_of_root(&self, root: NetRoot) -> Option<String> {
+        self.root_names.get(&root).cloned()
+    }
+
+    /// Every name on the net at `root`, sorted, empty when nothing names it.
+    ///
+    /// [`name_of_root`](Self::name_of_root) answers what the net is *called*;
+    /// this answers what it is *known as*, which is the question a classifier
+    /// asks. A rail whose winning name is the global label `SYS` is still the
+    /// `+3V3` rail, and reading only the winner made it neither a rail to
+    /// decouple nor a pull-up destination.
+    pub(crate) fn aliases_of_root(&self, root: NetRoot) -> BTreeSet<String> {
+        self.root_aliases.get(&root).cloned().unwrap_or_default()
+    }
+
+    /// Join the points that carry the same name.
+    ///
+    /// KiCad nets a sheet by name as well as by wire: two segments each
+    /// carrying a `SIG` label are one net, and every `GND` power symbol on the
+    /// sheet is the same rail. Wires and junctions alone answer for one piece
+    /// of copper, so without this a root is a *segment* rather than a net —
+    /// and a decoupling capacitor drawn the normal way, on its own stub with
+    /// its own `+3V3` symbol, shares no root with the pin it decouples.
+    ///
+    /// Anchoring each name at the first point that carries it and unioning the
+    /// rest into it makes every same-named point one root, whatever order the
+    /// map yields them in.
+    fn merge_named_nets(&mut self) {
+        let mut anchors: HashMap<String, (i64, i64)> = HashMap::new();
+        let named: Vec<((i64, i64), Vec<String>)> = self
+            .point_nets
+            .iter()
+            .map(|(k, names)| (*k, names.iter().map(|name| name.name.clone()).collect()))
+            .collect();
+        for (k, names) in named {
+            for name in names {
+                match anchors.get(&name) {
+                    Some(&anchor) => self.union(anchor, k),
+                    None => {
+                        anchors.insert(name, k);
+                    }
+                }
             }
         }
-        None
+    }
+
+    /// Resolve one winning name per root. Called once, by [`seed_net_graph`],
+    /// after the last union — a name is a property of the finished net, so
+    /// there is nothing to resolve until the graph stops moving.
+    fn name_nets(&mut self) {
+        let mut best: HashMap<NetRoot, NetName> = HashMap::new();
+        let mut aliases: HashMap<NetRoot, BTreeSet<String>> = HashMap::new();
+        for k in self.point_nets.keys().copied().collect::<Vec<_>>() {
+            let root = self.find(k);
+            for candidate in self.point_nets[&k].clone() {
+                aliases
+                    .entry(root)
+                    .or_default()
+                    .insert(candidate.name.clone());
+                let wins = match best.get(&root) {
+                    Some(held) => names_ahead_of(&candidate, held),
+                    None => true,
+                };
+                if wins {
+                    best.insert(root, candidate);
+                }
+            }
+        }
+        self.root_names = best
+            .into_iter()
+            .map(|(root, name)| (root, name.name))
+            .collect();
+        self.root_aliases = aliases;
+    }
+
+    /// The name of the net at a point — [`root_at`](Self::root_at) then
+    /// [`name_of_root`](Self::name_of_root). For reporting a single point only:
+    /// a caller asking whether two points are on one net wants their roots, not
+    /// their names, since a net can carry more than one.
+    pub(crate) fn net_at(&mut self, x: f64, y: f64) -> Option<String> {
+        let root = self.root_at(x, y);
+        self.name_of_root(root)
     }
 
     pub(crate) fn points_on_net(&mut self, net: &str) -> Vec<(i64, i64)> {
@@ -249,14 +422,23 @@ impl NetGraph {
         let net_keys: Vec<(i64, i64)> = self
             .point_nets
             .iter()
-            .filter(|(_, n)| n.as_str() == net)
+            .filter(|(_, names)| names.iter().any(|name| name.name == net))
             .map(|(k, _)| *k)
             .collect();
-        let net_roots: HashSet<(i64, i64)> = net_keys.iter().map(|k| self.find(*k)).collect();
+        let net_roots: HashSet<NetRoot> = net_keys.iter().map(|k| self.find(*k)).collect();
+        self.points_on_roots(&net_roots)
+    }
+
+    /// Every point on any of `roots` — the same walk [`points_on_net`] does,
+    /// for a caller that already holds identities rather than a name. Asking
+    /// once for several nets also walks the graph once instead of per net.
+    ///
+    /// [`points_on_net`]: Self::points_on_net
+    pub(crate) fn points_on_roots(&mut self, roots: &HashSet<NetRoot>) -> Vec<(i64, i64)> {
         let all_keys: Vec<(i64, i64)> = self.parent.keys().cloned().collect();
         all_keys
             .into_iter()
-            .filter(|k| net_roots.contains(&self.find(*k)))
+            .filter(|k| roots.contains(&self.find(*k)))
             .collect()
     }
 }
@@ -293,7 +475,7 @@ fn seed_net_graph(
         }
     };
     for label in labels {
-        graph.add_label(label.x, label.y, &label.net);
+        graph.add_label(label.x, label.y, &label.net, label.kind);
         attach(&mut graph, label.x, label.y);
     }
     for &(x, y) in junctions {
@@ -303,7 +485,26 @@ fn seed_net_graph(
     for &(x, y) in sheet_pins {
         graph.ensure(pt_key(x, y));
     }
+    graph.merge_named_nets();
+    graph.name_nets();
     graph
+}
+
+/// Each label paired with the graph root it sits on.
+///
+/// Two tools read the one relation from opposite ends — `find_shorted_nets`
+/// root-first, since more than one name on a root is a short, and
+/// `find_single_pin_nets` name-first, pooling the roots one name reaches. The
+/// walk lives here so a refinement to which label anchors which root cannot
+/// land in only one of them.
+pub(crate) fn label_roots<'a>(
+    graph: &mut NetGraph,
+    labels: &'a [Label],
+) -> Vec<((i64, i64), &'a Label)> {
+    labels
+        .iter()
+        .map(|label| (graph.root_at(label.x, label.y), label))
+        .collect()
 }
 
 /// The net graph for a whole tree, at [`COINCIDENT_TOLERANCE`].
@@ -339,11 +540,25 @@ pub(crate) struct PlacedPin {
     pub(crate) at: (f64, f64),
 }
 
+/// The items sitting on one point, rather than the counts and booleans the
+/// attachment predicates ask for. `trace_from_point` is the one tool whose
+/// answer *is* that inventory, so it reads this instead of scanning the tree
+/// again at a tolerance of its own (#539).
+pub(crate) struct PointDetail<'i> {
+    /// Component pins at the point, in the order the sheet places them. One
+    /// entry per pin, so two pins stacked on a point are both here.
+    pub(crate) pins: Vec<&'i PlacedPin>,
+    /// Junction dots at the point, as stored in the file.
+    pub(crate) junctions: Vec<(f64, f64)>,
+}
+
 /// Every item that can terminate a point on one sheet, under one tolerance.
 pub(crate) struct ConnectivityIndex<'a> {
     wires: &'a [Wire],
     labels: &'a [Label],
     on_wire: WireIndex<'a>,
+    on_bus: WireIndex<'a>,
+    bus_entry_wire_points: PointIndex,
     wire_ends: PointIndex,
     label_points: PointIndex,
     pin_points: PointIndex,
@@ -361,6 +576,7 @@ impl<'a> ConnectivityIndex<'a> {
     pub(crate) fn build(
         tree: &SexpNode,
         wires: &'a [Wire],
+        buses: &'a [Wire],
         labels: &'a [Label],
         tolerance: f64,
     ) -> Self {
@@ -377,11 +593,28 @@ impl<'a> ConnectivityIndex<'a> {
             .collect();
         let junctions = extract_junctions(tree);
         let sheet_pins = extract_sheet_pins(tree);
+        let on_bus = WireIndex::build(buses, tolerance);
+        // An entry terminates a wire only when saved geometry proves exactly
+        // one corner lies on a bus. Zero matches are detached; two matches are
+        // ambiguous between buses. Neither case licenses a guessed wire side.
+        let bus_entry_wire_points = extract_bus_entries(tree)
+            .into_iter()
+            .filter_map(|entry| entry.endpoints())
+            .filter_map(|(at, far)| {
+                match (on_bus.covers(at.0, at.1), on_bus.covers(far.0, far.1)) {
+                    (true, false) => Some(far),
+                    (false, true) => Some(at),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
 
         ConnectivityIndex {
             wires,
             labels,
             on_wire: WireIndex::build(wires, tolerance),
+            on_bus,
+            bus_entry_wire_points: PointIndex::build(bus_entry_wire_points, tolerance),
             wire_ends: PointIndex::build(
                 wires
                     .iter()
@@ -401,6 +634,9 @@ impl<'a> ConnectivityIndex<'a> {
                     .map(|label| (label.x, label.y)),
                 tolerance,
             ),
+            // Built from `placed_pins` in order, so a hit's ordinal indexes
+            // straight back into that slice — which is what lets
+            // `point_detail` report the pin and not just its coordinates.
             pin_points: PointIndex::build(placed_pins.iter().map(|p| p.at), tolerance),
             sheet_pin_points: PointIndex::build(sheet_pins, tolerance),
             junction_points: PointIndex::build(junctions, tolerance),
@@ -438,6 +674,18 @@ impl<'a> ConnectivityIndex<'a> {
         self.on_wire.covers_interior(x, y)
     }
 
+    /// Lies anywhere on a bus segment, endpoints included. This is geometric
+    /// attachment only: buses are bundles, never nodes in [`NetGraph`].
+    pub(crate) fn on_bus(&self, x: f64, y: f64) -> bool {
+        self.on_bus.covers(x, y)
+    }
+
+    /// A bus entry whose opposite corner is proven to touch exactly one bus
+    /// has its wire-side endpoint here.
+    pub(crate) fn has_bus_entry_wire_end(&self, x: f64, y: f64) -> bool {
+        self.bus_entry_wire_points.contains(x, y)
+    }
+
     /// How many wires lie under `(x, y)` — endpoint and interior alike. The
     /// booleans above cannot tell one wire passing from two wires crossing,
     /// and the junction reconciler needs that distinction: a dot on a lone
@@ -451,6 +699,35 @@ impl<'a> ConnectivityIndex<'a> {
 
     pub(crate) fn has_label(&self, x: f64, y: f64) -> bool {
         self.label_points.contains(x, y)
+    }
+
+    /// What is on `(x, y)`, item by item: the component pins there and the
+    /// junction dots there, under this index's tolerance. The predicates below
+    /// answer whether a point is attached; this answers what is attached, for
+    /// the tool that has to report it.
+    ///
+    /// Sheet pins and no-connect flags are indexed too but are deliberately not
+    /// returned: `trace_from_point` does not report them, and handing them over
+    /// unused would let the two drift apart silently.
+    pub(crate) fn point_detail(&self, x: f64, y: f64) -> PointDetail<'_> {
+        let mut pins: Vec<(usize, &PlacedPin)> = self
+            .pin_points
+            .hits_at(x, y)
+            .map(|(_, _, ordinal)| (ordinal, &self.placed_pins[ordinal]))
+            .collect();
+        let mut junctions: Vec<(usize, (f64, f64))> = self
+            .junction_points
+            .hits_at(x, y)
+            .map(|(jx, jy, ordinal)| (ordinal, (jx, jy)))
+            .collect();
+        // Bucket order is not file order, and a reported list that reorders
+        // itself with the query point is a list a caller cannot diff.
+        pins.sort_by_key(|(ordinal, _)| *ordinal);
+        junctions.sort_by_key(|(ordinal, _)| *ordinal);
+        PointDetail {
+            pins: pins.into_iter().map(|(_, pin)| pin).collect(),
+            junctions: junctions.into_iter().map(|(_, at)| at).collect(),
+        }
     }
 
     /// How many pins lie at `(x, y)`. A point that is itself a pin counts
@@ -485,6 +762,7 @@ impl<'a> ConnectivityIndex<'a> {
             || self.has_sheet_pin(x, y)
             || self.has_junction(x, y)
             || self.has_no_connect(x, y)
+            || self.has_bus_entry_wire_end(x, y)
             || self.wire_ends_at(x, y) >= 2
             || self.on_wire_interior(x, y)
     }
@@ -520,7 +798,9 @@ impl<'a> ConnectivityIndex<'a> {
 mod agreement_tests {
     use super::*;
     use crate::tools::{ServerConfig, ToolContext};
-    use konnect_sexp::schematic::{extract_all_net_labels, extract_wires, read_schematic};
+    use konnect_sexp::schematic::{
+        extract_all_net_labels, extract_buses, extract_wires, read_schematic,
+    };
     use serde_json::json;
     use std::io::Write;
     use std::sync::Arc;
@@ -613,6 +893,37 @@ mod agreement_tests {
         assert_eq!(components["unconnected_count"], 0, "{components}");
     }
 
+    /// The point the validator called connected is the point `trace_from_point`
+    /// inventories, and both read one index: the pins the decision was made on
+    /// are the pins reported. A second scan of its own is how this tool could
+    /// answer with a set the decision never saw (#539).
+    #[tokio::test]
+    async fn a_traced_point_reports_the_pins_the_validator_judged() {
+        let sch = schematic(&format!(
+            "\t(junction (at 100 80) (uuid \"j1\"))\n{}{}",
+            symbol("U1", "u1", 100.0, 80.0),
+            symbol("U2", "u2", 100.0, 80.0),
+        ));
+
+        let components = call("validate_component_connections", &sch, json!({})).await;
+        assert_eq!(components["unconnected_count"], 0, "{components}");
+
+        let trace = call("trace_from_point", &sch, json!({ "x": 100.0, "y": 80.0 })).await;
+        let mut found: Vec<&str> = trace["pins_here"]
+            .as_array()
+            .expect("pins_here is always present")
+            .iter()
+            .map(|pin| pin["reference"].as_str().unwrap())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, ["U1", "U2"], "{trace}");
+        assert_eq!(
+            trace["junctions_here"].as_array().unwrap().len(),
+            1,
+            "{trace}"
+        );
+    }
+
     /// A lone pin is unconnected for both tools — the agreement has to hold in
     /// the direction that still reports a fault, or the fix above is just a
     /// blanket "everything is connected".
@@ -627,6 +938,150 @@ mod agreement_tests {
         let components = call("validate_component_connections", &sch, json!({})).await;
         assert_eq!(components["unconnected_count"], 1, "{components}");
         assert_eq!(components["unconnected_pins"][0]["reference"], "U1");
+    }
+
+    fn bus(x1: f64, y1: f64, x2: f64, y2: f64, uuid: &str) -> String {
+        format!("\t(bus (pts (xy {x1} {y1}) (xy {x2} {y2})) (uuid \"{uuid}\"))\n")
+    }
+
+    fn bus_entry(x: f64, y: f64, dx: f64, dy: f64, uuid: &str) -> String {
+        format!(
+            "\t(bus_entry (at {x} {y}) (size {dx} {dy}) (stroke (width 0) (type default)) (uuid \"{uuid}\"))\n"
+        )
+    }
+
+    fn wire(x1: f64, y1: f64, x2: f64, y2: f64, uuid: &str) -> String {
+        format!("\t(wire (pts (xy {x1} {y1}) (xy {x2} {y2})) (uuid \"{uuid}\"))\n")
+    }
+
+    fn label(net: &str, x: f64, y: f64, uuid: &str) -> String {
+        format!("\t(label \"{net}\" (at {x} {y} 0) (uuid \"{uuid}\"))\n")
+    }
+
+    /// KiCad connects the corner opposite the bus only when the other corner
+    /// really lies on bus geometry. Both public validators consume that same
+    /// decision, and a label directly on the bus is not a floating label.
+    #[tokio::test]
+    async fn a_verified_bus_entry_terminates_only_its_wire_side_for_every_tool() {
+        let sch = schematic(&format!(
+            "{}{}{}{}{}",
+            bus(90.0, 80.0, 110.0, 80.0, "b1"),
+            bus_entry(100.0, 80.0, 2.54, 2.54, "be1"),
+            wire(102.54, 82.54, 120.0, 82.54, "w1"),
+            label("D0", 120.0, 82.54, "l1"),
+            label("D[0..3]", 95.0, 80.0, "l2"),
+        ));
+
+        let orphans = call("find_orphan_items", &sch, json!({})).await;
+        assert_eq!(orphans["orphan_count"], 0, "{orphans}");
+
+        let wires = call("validate_wire_connections", &sch, json!({})).await;
+        assert_eq!(wires["floating_count"], 0, "{wires}");
+
+        let (tree, wires, labels) = index_for(&sch);
+        let buses = extract_buses(&tree);
+        let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
+        assert!(index.on_bus(100.0, 80.0), "test setup needs a bus");
+        assert!(index.has_bus_entry_wire_end(102.54, 82.54));
+        assert!(!index.has_bus_entry_wire_end(100.0, 80.0));
+    }
+
+    /// The acceptance fixture was resaved by KiCad 10. Its companion README
+    /// records the CLI ERC comparison: KiCad does not report the wire/entry or
+    /// bus label as dangling (only the deliberately pin-less scalar label).
+    #[tokio::test]
+    async fn kicad_saved_bus_fixture_agrees_across_internal_validators() {
+        let sch = include_str!("../../tests/fixtures/bus_connectivity_kicad10.kicad_sch");
+
+        let orphans = call("find_orphan_items", sch, json!({})).await;
+        assert_eq!(orphans["orphan_count"], 0, "{orphans}");
+
+        let wires = call("validate_wire_connections", sch, json!({})).await;
+        assert_eq!(wires["floating_count"], 0, "{wires}");
+    }
+
+    #[test]
+    fn bus_entry_classification_abstains_for_detached_and_ambiguous_geometry() {
+        struct Case {
+            name: &'static str,
+            body: String,
+            wire_end: (f64, f64),
+        }
+        let cases = [
+            Case {
+                name: "direct wire-to-bus touch has no entry",
+                body: format!(
+                    "{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    wire(100.0, 80.0, 120.0, 80.0, "w1")
+                ),
+                wire_end: (100.0, 80.0),
+            },
+            Case {
+                name: "bus-side corner is not the wire side",
+                body: format!(
+                    "{}{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    bus_entry(100.0, 80.0, 2.54, 2.54, "be1"),
+                    wire(100.0, 80.0, 120.0, 80.0, "w1")
+                ),
+                wire_end: (100.0, 80.0),
+            },
+            Case {
+                name: "detached entry cannot infer a wire side",
+                body: format!(
+                    "{}{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    bus_entry(100.0, 85.0, 2.54, 2.54, "be1"),
+                    wire(102.54, 87.54, 120.0, 87.54, "w1")
+                ),
+                wire_end: (102.54, 87.54),
+            },
+            Case {
+                name: "entry with both corners on buses is ambiguous",
+                body: format!(
+                    "{}{}{}{}",
+                    bus(90.0, 80.0, 110.0, 80.0, "b1"),
+                    bus(90.0, 82.54, 110.0, 82.54, "b2"),
+                    bus_entry(100.0, 80.0, 0.0, 2.54, "be1"),
+                    wire(100.0, 82.54, 120.0, 82.54, "w1")
+                ),
+                wire_end: (100.0, 82.54),
+            },
+        ];
+
+        for case in cases {
+            let sch = schematic(&case.body);
+            let (tree, wires, labels) = index_for(&sch);
+            let buses = extract_buses(&tree);
+            let index =
+                ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
+            assert!(index.on_bus(100.0, 80.0), "{}", case.name);
+            assert!(
+                !index.has_bus_entry_wire_end(case.wire_end.0, case.wire_end.1),
+                "{}",
+                case.name
+            );
+            assert!(
+                !index.terminates_wire_end(case.wire_end.0, case.wire_end.1),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_label_near_but_outside_bus_tolerance_stays_floating() {
+        let sch = schematic(&format!(
+            "{}{}",
+            bus(90.0, 80.0, 110.0, 80.0, "b1"),
+            label("NEAR_BUS", 100.0, 80.02, "l1")
+        ));
+
+        let orphans = call("find_orphan_items", &sch, json!({ "tolerance": 0.01 })).await;
+        assert_eq!(orphans["orphan_count"], 1, "{orphans}");
+        assert_eq!(orphans["orphans"][0]["type"], "floating_label");
+        assert_eq!(orphans["orphans"][0]["net"], "NEAR_BUS");
     }
 
     /// The component validator still reports the value it always has, which now
@@ -701,7 +1156,8 @@ mod agreement_tests {
             sheet(120.0, 70.0, 120.0, 80.0),
         ));
         let (tree, wires, labels) = index_for(&sch);
-        let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+        let buses = Vec::new();
+        let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
 
         assert!(index.has_sheet_pin(120.0, 80.0));
         let mut graph = net_graph_for(&tree, &wires, &labels);
@@ -726,7 +1182,9 @@ mod agreement_tests {
                 sheet(110.0, 70.0, 120.0, 80.0),
             ));
             let (tree, wires, labels) = index_for(&sch);
-            let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+            let buses = Vec::new();
+            let index =
+                ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
 
             assert!(index.has_sheet_pin(120.0, 80.0));
             let mut graph = net_graph_for(&tree, &wires, &labels);
@@ -742,6 +1200,39 @@ mod agreement_tests {
         format!(
             "\t(symbol\n\t\t(lib_id \"power:GND\")\n\t\t(at {x} {y} 0)\n\t\t(unit 1)\n\t\t(uuid \"p1\")\n\t\t(property \"Reference\" \"{reference}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t\t(property \"Value\" \"{value}\"\n\t\t\t(at {x} {y} 0)\n\t\t)\n\t)\n"
         )
+    }
+
+    /// The real KiCad fixture, at the graph level: `TP7` reaches the `+3V3`
+    /// rail only through the `ALT` label sitting on the second `+3V3` power
+    /// symbol's own pin. KiCad nets them together (`+3V3` has five pins), so a
+    /// graph that keeps one name per point loses that join — and with it the
+    /// alias every classifier reads.
+    ///
+    /// Provenance and KiCad's own net table: `two_name_nets.README.md`.
+    #[tokio::test]
+    async fn an_alias_on_a_power_symbol_pin_joins_its_segment() {
+        let sch = include_str!("../../tests/fixtures/two_name_nets.kicad_sch");
+        let (tree, wires, labels) = index_for(sch);
+        let mut graph = net_graph_for(&tree, &wires, &labels);
+
+        // TP7's pin, and U1's VCC pin at the other end of the rail.
+        let stub = graph.root_at(30.48, 88.9);
+        let rail = graph.root_at(110.49, 72.39);
+        assert_eq!(stub, rail, "TP7 joins the rail through the ALT alias");
+        assert_eq!(graph.name_of_root(rail), Some("+3V3".to_string()));
+        assert!(
+            graph.aliases_of_root(rail).contains("ALT"),
+            "the alias survives to the classifiers: {:?}",
+            graph.aliases_of_root(rail)
+        );
+
+        // The same join without an alias: two `+3V3` power symbols on separate
+        // stubs are one rail, and C1's pin reaches U1's through it.
+        assert_eq!(graph.root_at(59.69, 96.52), rail);
+
+        // And a plain label doing it: `U1.5` and `R1.2` carry `SDA` on segments
+        // that share no wire. KiCad nets both (`/SDA` has two pins).
+        assert_eq!(graph.root_at(120.65, 77.47), graph.root_at(160.02, 63.5));
     }
 
     /// A power symbol's net name is synthesised as a pseudo-label sitting on
